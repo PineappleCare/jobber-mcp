@@ -20,3 +20,6 @@ tokens.enc
 key.hex
 .claude/
 CLAUDE.md
+
+# Internal mirror tooling. Names the private upstream, so it stays local.
+sync-from-dev.sh
