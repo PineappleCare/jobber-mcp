@@ -1,0 +1,113 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.adeocode/jobber-mcp",
+  "description": "Read-only connector for Jobber: search clients, invoices, quotes, jobs, revenue, and schedule.",
+  "repository": {
+    "url": "https://github.com/adeocode/jobber-mcp",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@adeocode/jobber-mcp",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "JOBBER_CLIENT_ID",
+          "description": "Client ID from your Jobber developer application (developer.getjobber.com)",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "JOBBER_CLIENT_SECRET",
+          "description": "Client Secret from your Jobber developer application",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "ENCRYPTION_KEY",
+          "description": "Optional 64-char hex key. Leave unset to auto-generate one in the OS keychain (file fallback).",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "JOBBER_REDIRECT_PORT",
+          "description": "Local port for the OAuth callback listener (default: 5679). Change if 5679 is in use.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "JOBBER_AUTH_URL",
+          "description": "Override the Jobber OAuth authorization endpoint.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "JOBBER_TOKEN_URL",
+          "description": "Override the Jobber OAuth token endpoint.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "JOBBER_GRAPHQL_URL",
+          "description": "Override the Jobber GraphQL endpoint.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "JOBBER_GRAPHQL_VERSION",
+          "description": "Pinned Jobber GraphQL API version sent as X-JOBBER-GRAPHQL-VERSION (default: 2025-04-16).",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "JOBBER_READ_ONLY",
+          "description": "Blocks write-tool registration. Defaults to true; v1 ships no write tools regardless.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "TRANSPORT",
+          "description": "Selects the MCP transport to start: stdio (default) or http.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "MCP_BASE_URL",
+          "description": "Public base URL used to build the OAuth callback link. Required when TRANSPORT=http.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "PORT",
+          "description": "HTTP listen port when TRANSPORT=http (default: 3000).",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "MCP_API_KEY",
+          "description": "Optional bearer token required on /mcp requests when set.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

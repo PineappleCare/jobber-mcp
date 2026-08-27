@@ -1,0 +1,74 @@
+{
+  "name": "@adeocode/jobber-mcp",
+  "mcpName": "io.github.adeocode/jobber-mcp",
+  "version": "1.0.0",
+  "description": "Read-only MCP server for Jobber. Lets Claude, ChatGPT or Microsoft Copilot answer questions from a live Jobber account.",
+  "main": "build/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src",
+    "build": "tsc --project tsconfig.build.json && node -e \"require('fs').chmodSync('build/index.js', 0o755)\"",
+    "start": "node build/index.js",
+    "inspect": "npx @modelcontextprotocol/inspector node build/index.js",
+    "smoke": "node scripts/smoke.mjs",
+    "measure-costs": "node scripts/measure-costs.mjs",
+    "verify:version-sync": "node scripts/verify-version-sync.mjs",
+    "verify:no-secrets": "node scripts/verify-no-secrets.mjs",
+    "prepublishOnly": "npm run verify:version-sync && npm run lint && npm test && npm run build && npm run smoke && npm run verify:no-secrets"
+  },
+  "bin": {
+    "jobber-mcp": "build/index.js"
+  },
+  "files": [
+    "build",
+    "LICENSE",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adeocode/jobber-mcp.git"
+  },
+  "keywords": [
+    "jobber",
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "chatgpt",
+    "copilot",
+    "field-service",
+    "home-services",
+    "graphql",
+    "crm",
+    "integration"
+  ],
+  "author": "Adeocode (https://www.adeocode.com)",
+  "license": "MIT",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/adeocode/jobber-mcp/issues"
+  },
+  "homepage": "https://www.adeocode.com/jobber-mcp/",
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "@napi-rs/keyring": "^1.3.0",
+    "dotenv": "^16.6.1",
+    "hono": "^4.6.0",
+    "open": "^11.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "@vitest/coverage-v8": "^4.1.7",
+    "eslint": "^9.39.2",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.7"
+  }
+}
