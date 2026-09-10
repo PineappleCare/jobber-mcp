@@ -62,6 +62,7 @@ interface ToolResultContent {
 interface ToolConfig<Args, Cost extends number | Record<string, number> = number> {
   description: string;
   inputSchema?: Args;
+  annotations?: Record<string, boolean>;
   /**
    * The tool's declared cost ceiling(s) - a single number for a tool with one query path, or a
    * named record (e.g. `{ main: 50, paymentsPage: 20 }`) for a tool whose handler makes more than
@@ -160,7 +161,7 @@ export function registerReadOnlyTool<
   config: ToolConfig<Args, Cost>,
   handler: (args: InferArgs<Args>, jobberGraphQL: CostedGraphQL<Cost>) => Promise<ToolResultContent>
 ): void {
-  registerTool(server, name, config, handler, jobberGraphQL);
+  registerTool(server, name, { ...config, annotations: { readOnlyHint: true, openWorldHint: true, ...config.annotations } }, handler, jobberGraphQL);
 }
 
 function registerTool<
@@ -184,6 +185,7 @@ function registerTool<
     name,
     {
       description: config.description,
+      ...(config.annotations ? { annotations: config.annotations } : {}),
       ...(inputSchema ? { inputSchema } : {}),
     },
     async (args: any) => {
@@ -201,6 +203,20 @@ function registerTool<
   );
 }
 
+export type WriteCapability = "records" | "scheduling" | "communications";
+
+/**
+ * A second, narrow gate after JOBBER_READ_ONLY. This lets a host expose record
+ * changes without accidentally also exposing scheduling or customer sends.
+ */
+export function isWriteCapabilityEnabled(capability: WriteCapability): boolean {
+  const configured = (process.env.JOBBER_WRITE_CAPABILITIES ?? "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  return configured.includes(capability);
+}
+
 /**
  * Registers a write tool. Write tools must be deliberately enabled with
  * JOBBER_READ_ONLY=false and use the no-retry mutation client: an ambiguous
@@ -214,7 +230,7 @@ export function registerWriteTool<
 >(
   server: McpServer,
   name: string,
-  config: ToolConfig<Args, Cost>,
+  config: ToolConfig<Args, Cost> & { capability: WriteCapability },
   handler: (args: InferArgs<Args>, jobberGraphQL: CostedGraphQL<Cost>) => Promise<ToolResultContent>
 ): void {
   if (isReadOnly()) {
@@ -222,5 +238,25 @@ export function registerWriteTool<
       `Refusing to register write tool "${name}": JOBBER_READ_ONLY is enabled.`
     );
   }
-  registerTool(server, name, config, handler, jobberGraphQLWrite);
+  if (!isWriteCapabilityEnabled(config.capability)) {
+    throw new Error(
+      `Refusing to register write tool "${name}": JOBBER_WRITE_CAPABILITIES does not include "${config.capability}".`
+    );
+  }
+  registerTool(
+    server,
+    name,
+    {
+      ...config,
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: true,
+        destructiveHint: config.capability === "communications" || config.capability === "scheduling",
+        idempotentHint: false,
+        ...config.annotations,
+      },
+    },
+    handler,
+    jobberGraphQLWrite
+  );
 }

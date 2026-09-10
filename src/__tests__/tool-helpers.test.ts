@@ -22,6 +22,7 @@ vi.mock("../jobber/client.js", () => ({
 import { isReadOnly, pageSizeSchema, pageProgress, registerReadOnlyTool, registerWriteTool } from "../tool-helpers.js";
 
 const ORIGINAL_READ_ONLY = process.env.JOBBER_READ_ONLY;
+const ORIGINAL_WRITE_CAPABILITIES = process.env.JOBBER_WRITE_CAPABILITIES;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -30,6 +31,8 @@ beforeEach(() => {
 afterEach(() => {
   if (ORIGINAL_READ_ONLY === undefined) delete process.env.JOBBER_READ_ONLY;
   else process.env.JOBBER_READ_ONLY = ORIGINAL_READ_ONLY;
+  if (ORIGINAL_WRITE_CAPABILITIES === undefined) delete process.env.JOBBER_WRITE_CAPABILITIES;
+  else process.env.JOBBER_WRITE_CAPABILITIES = ORIGINAL_WRITE_CAPABILITIES;
 });
 
 describe("isReadOnly", () => {
@@ -230,7 +233,7 @@ describe("registerWriteTool", () => {
     process.env.JOBBER_READ_ONLY = "true";
     const server = fakeServer();
     expect(() =>
-      registerWriteTool(server as any, "delete_client", { description: "x", maxCost: 100 }, async () => ({
+      registerWriteTool(server as any, "delete_client", { description: "x", capability: "records", maxCost: 100 }, async () => ({
         content: [{ type: "text", text: "should never run" }],
       }))
     ).toThrow(/JOBBER_READ_ONLY/);
@@ -239,8 +242,9 @@ describe("registerWriteTool", () => {
 
   it("registers normally when JOBBER_READ_ONLY is false and uses the mutation executor", async () => {
     process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "records";
     const server = fakeServer();
-    registerWriteTool(server as any, "delete_client", { description: "x", maxCost: 100 }, async () => ({
+    registerWriteTool(server as any, "delete_client", { description: "x", capability: "records", maxCost: 100 }, async () => ({
       content: [{ type: "text", text: "ok" }],
     }));
     expect(server.registerTool).toHaveBeenCalledWith("delete_client", expect.anything(), expect.any(Function));
@@ -251,11 +255,12 @@ describe("registerWriteTool", () => {
 
   it("binds write handlers to the mutation executor instead of the retrying read executor", async () => {
     process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "records";
     const server = fakeServer();
     registerWriteTool(
       server as any,
       "create_client",
-      { description: "x", maxCost: 100 },
+      { description: "x", capability: "records", maxCost: 100 },
       async (_args, jobberGraphQL) => {
         const data = await jobberGraphQL("mutation { createClient { id } }", { input: {} });
         return { content: [{ type: "text", text: JSON.stringify(data) }] };

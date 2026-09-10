@@ -23,6 +23,10 @@ const EXPECTED_TOOLS = [
   "schedule_lookup",
   "requests_inbox",
   "get_audit_log",
+  "search_records",
+  "get_record",
+  "catalog_search",
+  "team_list",
 ];
 
 function send(child, message) {
