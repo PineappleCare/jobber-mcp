@@ -23,7 +23,15 @@ const REDACTED_KEYS = new Set([
 // Business/PII-bearing fields that are hashed rather than fully redacted - full redaction would
 // make the audit log useless for its purpose (knowing what was searched for), but the raw value
 // (e.g. a client's name/email/phone typed into find_client) shouldn't sit in plaintext forever.
-const HASHED_KEYS = new Set(["search_term"]);
+const HASHED_KEYS = new Set([
+  "search_term",
+  // Write inputs can contain client names and internal operational notes. The
+  // audit log needs evidence of the action, not a second plaintext copy.
+  "body",
+  "first_name",
+  "last_name",
+  "company_name",
+]);
 
 function normalizeKey(k: string): string {
   return k.toLowerCase().replace(/[^a-z0-9]/g, "");

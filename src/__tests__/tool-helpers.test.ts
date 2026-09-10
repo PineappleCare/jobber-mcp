@@ -5,8 +5,9 @@ const { mockAppendAuditLog } = vi.hoisted(() => ({
   mockAppendAuditLog: vi.fn().mockResolvedValue(undefined),
 }));
 
-const { mockJobberGraphQL } = vi.hoisted(() => ({
+const { mockJobberGraphQL, mockJobberGraphQLWrite } = vi.hoisted(() => ({
   mockJobberGraphQL: vi.fn().mockResolvedValue({ ok: true }),
+  mockJobberGraphQLWrite: vi.fn().mockResolvedValue({ ok: true }),
 }));
 
 vi.mock("../utils/auditLog.js", () => ({
@@ -15,6 +16,7 @@ vi.mock("../utils/auditLog.js", () => ({
 
 vi.mock("../jobber/client.js", () => ({
   jobberGraphQL: mockJobberGraphQL,
+  jobberGraphQLWrite: mockJobberGraphQLWrite,
 }));
 
 import { isReadOnly, pageSizeSchema, pageProgress, registerReadOnlyTool, registerWriteTool } from "../tool-helpers.js";
@@ -235,12 +237,36 @@ describe("registerWriteTool", () => {
     expect(server.registerTool).not.toHaveBeenCalled();
   });
 
-  it("registers normally when JOBBER_READ_ONLY is false", () => {
+  it("registers normally when JOBBER_READ_ONLY is false and uses the mutation executor", async () => {
     process.env.JOBBER_READ_ONLY = "false";
     const server = fakeServer();
     registerWriteTool(server as any, "delete_client", { description: "x", maxCost: 100 }, async () => ({
       content: [{ type: "text", text: "ok" }],
     }));
     expect(server.registerTool).toHaveBeenCalledWith("delete_client", expect.anything(), expect.any(Function));
+    await server.handlers["delete_client"]({});
+    expect(mockJobberGraphQLWrite).not.toHaveBeenCalled();
+    expect(mockJobberGraphQL).not.toHaveBeenCalled();
+  });
+
+  it("binds write handlers to the mutation executor instead of the retrying read executor", async () => {
+    process.env.JOBBER_READ_ONLY = "false";
+    const server = fakeServer();
+    registerWriteTool(
+      server as any,
+      "create_client",
+      { description: "x", maxCost: 100 },
+      async (_args, jobberGraphQL) => {
+        const data = await jobberGraphQL("mutation { createClient { id } }", { input: {} });
+        return { content: [{ type: "text", text: JSON.stringify(data) }] };
+      }
+    );
+    await server.handlers["create_client"]({});
+    expect(mockJobberGraphQLWrite).toHaveBeenCalledWith(
+      "mutation { createClient { id } }",
+      { input: {} },
+      100
+    );
+    expect(mockJobberGraphQL).not.toHaveBeenCalled();
   });
 });

@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { appendAuditLog } from "./utils/auditLog.js";
-import { jobberGraphQL } from "./jobber/client.js";
+import { jobberGraphQL, jobberGraphQLWrite } from "./jobber/client.js";
 
 export function isReadOnly(): boolean {
   return (process.env.JOBBER_READ_ONLY ?? "true").toLowerCase() !== "false";
@@ -59,7 +59,7 @@ interface ToolResultContent {
   isError?: boolean;
 }
 
-interface ReadOnlyToolConfig<Args, Cost extends number | Record<string, number> = number> {
+interface ToolConfig<Args, Cost extends number | Record<string, number> = number> {
   description: string;
   inputSchema?: Args;
   /**
@@ -92,9 +92,16 @@ export type CostedGraphQL<Cost extends number | Record<string, number>> = Cost e
   ? <T = any>(query: string, variables?: Record<string, unknown>) => Promise<T>
   : <T = any>(query: string, variables: Record<string, unknown> | undefined, costKey: keyof Cost & string) => Promise<T>;
 
+type GraphQLExecutor = <T = any>(
+  query: string,
+  variables: Record<string, unknown> | undefined,
+  maxCost: number
+) => Promise<T>;
+
 function makeCostedGraphQL<Cost extends number | Record<string, number>>(
   toolName: string,
-  maxCost: Cost | undefined
+  maxCost: Cost | undefined,
+  execute: GraphQLExecutor = jobberGraphQL
 ): CostedGraphQL<Cost> {
   return ((query: string, variables?: Record<string, unknown>, costKey?: string) => {
     if (maxCost === undefined) {
@@ -104,7 +111,7 @@ function makeCostedGraphQL<Cost extends number | Record<string, number>>(
     if (cost === undefined) {
       throw new Error(`registerReadOnlyTool("${toolName}"): no maxCost declared for cost key "${String(costKey)}"`);
     }
-    return jobberGraphQL(query, variables, cost);
+    return execute(query, variables, cost);
   }) as CostedGraphQL<Cost>;
 }
 
@@ -150,11 +157,24 @@ export function registerReadOnlyTool<
 >(
   server: McpServer,
   name: string,
-  config: ReadOnlyToolConfig<Args, Cost>,
+  config: ToolConfig<Args, Cost>,
   handler: (args: InferArgs<Args>, jobberGraphQL: CostedGraphQL<Cost>) => Promise<ToolResultContent>
 ): void {
+  registerTool(server, name, config, handler, jobberGraphQL);
+}
+
+function registerTool<
+  Args extends Record<string, z.ZodTypeAny> | undefined,
+  Cost extends number | Record<string, number> = number
+>(
+  server: McpServer,
+  name: string,
+  config: ToolConfig<Args, Cost>,
+  handler: (args: InferArgs<Args>, jobberGraphQL: CostedGraphQL<Cost>) => Promise<ToolResultContent>,
+  execute: GraphQLExecutor
+): void {
   const inputSchema = config.inputSchema ? auditValidationFailures(z.object(config.inputSchema), name) : undefined;
-  const runQuery = makeCostedGraphQL(name, config.maxCost);
+  const runQuery = makeCostedGraphQL(name, config.maxCost, execute);
 
   // The SDK's registerTool overloads are exact-shaped around its full result
   // union (including elicitation's InputRequiredResult, which this wrapper
@@ -182,9 +202,11 @@ export function registerReadOnlyTool<
 }
 
 /**
- * Registers a write tool. v1 never calls this for any tool - no write tools
- * are registered regardless of configuration - but the gate must exist and
- * be real now, so it is exercised directly by unit tests.
+ * Registers a write tool. Write tools must be deliberately enabled with
+ * JOBBER_READ_ONLY=false and use the no-retry mutation client: an ambiguous
+ * network failure must never create a duplicate record through an automatic
+ * retry. The caller is still responsible for configuring its MCP host to ask
+ * for interactive approval before it invokes this tool.
  */
 export function registerWriteTool<
   Args extends Record<string, z.ZodTypeAny> | undefined,
@@ -192,7 +214,7 @@ export function registerWriteTool<
 >(
   server: McpServer,
   name: string,
-  config: ReadOnlyToolConfig<Args, Cost>,
+  config: ToolConfig<Args, Cost>,
   handler: (args: InferArgs<Args>, jobberGraphQL: CostedGraphQL<Cost>) => Promise<ToolResultContent>
 ): void {
   if (isReadOnly()) {
@@ -200,5 +222,5 @@ export function registerWriteTool<
       `Refusing to register write tool "${name}": JOBBER_READ_ONLY is enabled.`
     );
   }
-  registerReadOnlyTool(server, name, config, handler);
+  registerTool(server, name, config, handler, jobberGraphQLWrite);
 }

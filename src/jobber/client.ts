@@ -209,10 +209,11 @@ function isPermissionError(body: any): boolean {
  * enforcing the tool's declared max cost via the cost governor and handling
  * THROTTLED (which Jobber can send as HTTP 200) and HTTP 429 per the spec.
  */
-export async function jobberGraphQL<T = any>(
+async function executeGraphQL<T = any>(
   query: string,
   variables: Record<string, unknown> | undefined,
-  maxCost: number
+  maxCost: number,
+  isMutation: boolean
 ): Promise<T> {
   const ctx = requireSessionContext();
   const governor = await getGovernorForContext(ctx);
@@ -230,6 +231,11 @@ export async function jobberGraphQL<T = any>(
       const { status, retryAfterHeader, body, parseFailed } = await postOnce(token, query, variables);
 
       if (status === 429) {
+        if (isMutation) {
+          throw new JobberApiError(
+            "Jobber rate-limited this write before a result was returned. Its outcome is unknown; check Jobber before trying again."
+          );
+        }
         if (rateLimitRetries >= MAX_429_RETRIES) {
           throw new JobberApiError("Jobber rate limit (HTTP 429) exceeded after 3 retries.");
         }
@@ -246,6 +252,11 @@ export async function jobberGraphQL<T = any>(
       }
 
       if (isThrottled(body)) {
+        if (isMutation) {
+          throw new JobberApiError(
+            "Jobber throttled this write before a result was returned. Its outcome is unknown; check Jobber before trying again."
+          );
+        }
         if (throttleRetries >= MAX_THROTTLE_RETRIES) {
           throw new JobberApiError(
             "Jobber API is still throttled after one retry. The API cost budget needs more time to refill - please try again shortly."
@@ -273,11 +284,16 @@ export async function jobberGraphQL<T = any>(
         );
       }
 
-      // 5xx is typically transient (gateway blips, deploys) - retry a couple of times with
-      // backoff before treating it as permanent, whether or not the body carries an errors
-      // array. Checked ahead of the errors-array/generic-status branches below so a 5xx with
-      // an errors array still gets retried instead of failing on the first attempt.
-      if (status >= 500 && fiveXxRetries < MAX_5XX_RETRIES) {
+      // 5xx is typically transient for a read (gateway blips, deploys), so reads retry a
+      // couple of times. A mutation gets no retry: the remote side could have committed before
+      // returning a gateway error. Checked ahead of the errors-array/generic-status branches so
+      // a 5xx with an errors array follows the same safe mutation behavior.
+      if (isMutation && status >= 500) {
+        throw new JobberApiError(
+          "Jobber returned a server error for this write. Its outcome is unknown; check Jobber before trying again."
+        );
+      }
+      if (!isMutation && status >= 500 && fiveXxRetries < MAX_5XX_RETRIES) {
         fiveXxRetries++;
         await sleep(FIVE_XX_BACKOFF_MS[Math.min(fiveXxRetries - 1, FIVE_XX_BACKOFF_MS.length - 1)]);
         continue;
@@ -320,4 +336,29 @@ export async function jobberGraphQL<T = any>(
       governor.releaseReservation(maxCost);
     }
   }
+}
+
+/**
+ * Executes a fixed, reviewed read query. Read requests may use bounded retries
+ * for transient Jobber throttling and server failures.
+ */
+export async function jobberGraphQL<T = any>(
+  query: string,
+  variables: Record<string, unknown> | undefined,
+  maxCost: number
+): Promise<T> {
+  return executeGraphQL(query, variables, maxCost, false);
+}
+
+/**
+ * Executes a fixed, reviewed mutation. It deliberately performs no automatic
+ * retry after a throttled, rate-limited, or 5xx response because Jobber may
+ * have committed the mutation even when the caller did not receive a result.
+ */
+export async function jobberGraphQLWrite<T = any>(
+  query: string,
+  variables: Record<string, unknown> | undefined,
+  maxCost: number
+): Promise<T> {
+  return executeGraphQL(query, variables, maxCost, true);
 }

@@ -1,8 +1,8 @@
 {
-  "name": "@adeocode/jobber-mcp",
-  "mcpName": "io.github.adeocode/jobber-mcp",
-  "version": "1.0.0",
-  "description": "Read-only MCP server for Jobber. Lets Claude, ChatGPT or Microsoft Copilot answer questions from a live Jobber account.",
+  "name": "@pineapplecare/jobber-mcp",
+  "mcpName": "io.github.pineapplecare/jobber-mcp",
+  "version": "1.1.0",
+  "description": "Jobber MCP server with conservative, approval-compatible client writes disabled by default.",
   "main": "build/index.js",
   "engines": {
     "node": ">=18"
@@ -31,7 +31,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/adeocode/jobber-mcp.git"
+    "url": "git+https://github.com/PineappleCare/jobber-mcp.git"
   },
   "keywords": [
     "jobber",
@@ -46,13 +46,13 @@
     "crm",
     "integration"
   ],
-  "author": "Adeocode (https://www.adeocode.com)",
+  "author": "PineappleCare (based on work by Adeocode)",
   "license": "MIT",
   "type": "module",
   "bugs": {
-    "url": "https://github.com/adeocode/jobber-mcp/issues"
+    "url": "https://github.com/PineappleCare/jobber-mcp/issues"
   },
-  "homepage": "https://www.adeocode.com/jobber-mcp/",
+  "homepage": "https://github.com/PineappleCare/jobber-mcp#readme",
   "dependencies": {
     "@hono/node-server": "^1.13.0",
     "@modelcontextprotocol/server": "^2.0.0",

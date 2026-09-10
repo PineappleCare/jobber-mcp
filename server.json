@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.adeocode/jobber-mcp",
-  "description": "Read-only connector for Jobber: search clients, invoices, quotes, jobs, revenue, and schedule.",
+  "name": "io.github.pineapplecare/jobber-mcp",
+  "description": "Jobber connector with read tools and conservative client writes disabled by default.",
   "repository": {
-    "url": "https://github.com/adeocode/jobber-mcp",
+    "url": "https://github.com/PineappleCare/jobber-mcp",
     "source": "github"
   },
-  "version": "1.0.0",
+  "version": "1.1.0",
   "packages": [
     {
       "registryType": "npm",
-      "identifier": "@adeocode/jobber-mcp",
-      "version": "1.0.0",
+      "identifier": "@pineapplecare/jobber-mcp",
+      "version": "1.1.0",
       "transport": {
         "type": "stdio"
       },
@@ -74,7 +74,7 @@
         },
         {
           "name": "JOBBER_READ_ONLY",
-          "description": "Blocks write-tool registration. Defaults to true; v1 ships no write tools regardless.",
+          "description": "Blocks write tools. Defaults to true; set false only behind interactive approvals.",
           "isRequired": false,
           "format": "string",
           "isSecret": false

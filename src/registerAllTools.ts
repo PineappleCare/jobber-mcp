@@ -10,12 +10,15 @@ import { registerRevenueSummaryTool } from "./tools/revenue-summary.js";
 import { registerScheduleLookupTool } from "./tools/schedule-lookup.js";
 import { registerRequestsInboxTool } from "./tools/requests-inbox.js";
 import { registerGetAuditLogTool } from "./tools/get-audit-log.js";
+import { registerCreateClientTool } from "./tools/create-client.js";
+import { registerUpdateClientCompanyNameTool } from "./tools/update-client-company-name.js";
+import { isReadOnly } from "./tool-helpers.js";
 
 /**
- * Registers every v1 tool and resource. All tools are read-only; no write
- * tool is registered here regardless of JOBBER_READ_ONLY, and there is no
- * raw/passthrough GraphQL tool. get_audit_log is the one exception to
- * "every tool queries Jobber" - it reads this server's own local audit log.
+ * Registers every tool and resource. Reads are always available. The two
+ * reviewed write tools are absent unless JOBBER_READ_ONLY=false; there is no
+ * raw/passthrough GraphQL tool. get_audit_log is the one exception to "every
+ * tool queries Jobber" - it reads this server's own local audit log.
  */
 export function registerAllTools(server: McpServer): void {
   registerAuthTools(server);
@@ -29,4 +32,8 @@ export function registerAllTools(server: McpServer): void {
   registerScheduleLookupTool(server);
   registerRequestsInboxTool(server);
   registerGetAuditLogTool(server);
+  if (!isReadOnly()) {
+    registerCreateClientTool(server);
+    registerUpdateClientCompanyNameTool(server);
+  }
 }

@@ -1,14 +1,13 @@
-# Jobber MCP Server: Connect Claude, ChatGPT or Copilot to Jobber
+# PineappleCare Jobber MCP
 
-### Built by [Adeocode](https://www.adeocode.com/?utm_source=github&utm_medium=readme&utm_campaign=jobber-mcp&utm_content=top-byline): custom software for home service businesses
+Public PineappleCare derivative of [Adeocode's Jobber MCP](https://github.com/adeocode/jobber-mcp), used as the constrained Jobber connector for Williams Solutions. The upstream project is MIT licensed; its `LICENSE` and attribution are retained here.
 
-We build integrations and internal systems for HVAC, plumbing, roofing, coatings, fencing and landscaping companies, on top of the tools they already run. The client owns the code, including this connector. [Book a 15-minute call](https://www.adeocode.com/book?src=jobber-mcp&utm_source=github&utm_medium=readme&utm_campaign=jobber-mcp&utm_content=top-byline-call)
+This server reads live data from [Jobber](https://getjobber.com) and, only when deliberately enabled, can create a basic client or update a known client's company name. It never exposes raw GraphQL or broad operational writes.
 
----
+**TL;DR:** Read-only is the default. Setting `JOBBER_READ_ONLY=false` exposes two small write tools that must be protected by the MCP host's interactive approval policy. Write requests have no automatic retries: if the network result is ambiguous, check Jobber before trying again. OAuth tokens are encrypted at rest with AES-256-GCM, and every tool call is locally audited.
 
-Open-source [Model Context Protocol](https://modelcontextprotocol.io) server that lets Claude, ChatGPT or Microsoft Copilot read live data from [Jobber](https://getjobber.com): clients, jobs, quotes, invoices, revenue and the schedule. Ask the question in plain English and get the answer from your account, without exporting anything into a chat window.
-
-**TL;DR:** 12 tools. Read-only, so it cannot change your account. Runs on your machine over stdio, or as a remote server over Streamable HTTP for ChatGPT and Copilot Studio. Budgets every query against Jobber's 10,000-point limit, which is the part most Jobber integrations get wrong. OAuth tokens encrypted at rest with AES-256-GCM. No relay server and no middleman. MIT licensed, free forever.
+> [!WARNING]
+> `clientCreate` and `clientEdit` are implemented from Jobber's current documented GraphQL mutation families, but are not enabled in the Williams Hermes deployment until a live schema/permission probe validates their scopes. Keep `JOBBER_READ_ONLY=true` everywhere else.
 
 **Who this is for:** owners and office managers running a shop on Jobber, and the developers who build for them. If you can paste a block into a config file, you can use this.
 
@@ -75,7 +74,7 @@ You can also read the [measured cost of every tool](#cost-table) below. Those nu
 
 ## Safety: what it can and cannot do
 
-**It is read-only.** Version 1 ships read tools only. It can look, count and summarize. It cannot create a job, send an invoice, or move a visit, so the worst failure is a wrong answer rather than a wrong action. Write tools will arrive one at a time, each behind an explicit approval step, each logged.
+**It is read-only by default.** The connector can look, count and summarize. Setting `JOBBER_READ_ONLY=false` adds only `create_client` and `update_client_company_name`; no deletion, scheduling, invoice, quote, note, or raw GraphQL tool exists. Configure the MCP client to request interactive approval every time before enabling either write. A write is never automatically retried after a rate limit, throttle, or server error, because Jobber may already have committed it.
 
 **The model never writes its own queries.** Every GraphQL document is fixed and reviewed in `src/jobber/queries.ts`. The model chooses which tool to call and what arguments to pass, and that is all. There is no raw query tool, which keeps both the access and the API cost predictable.
 
@@ -83,7 +82,7 @@ You can also read the [measured cost of every tool](#cost-table) below. Those nu
 
 **Nothing routes through us.** The connector runs on your hardware and talks straight to Jobber. There is no Adeocode cloud service in the middle, because there is no cloud service at all.
 
-**Every call is logged locally.** `~/.jobber-mcp/audit.log` records each tool call with a timestamp, the arguments, and the outcome. Tokens and secrets are never written to it, and `find_client`'s search term is hashed rather than stored, since it can contain a customer's name or phone number. Read it back with the `get_audit_log` tool.
+**Every call is logged locally.** `~/.jobber-mcp/audit.log` records each tool call with a timestamp, safe arguments, and the outcome. Tokens and secrets are never written to it. Client searches, names, and internal note bodies are hashed rather than stored in plaintext. Read it back with the `get_audit_log` tool.
 
 **One honest limit.** The connector reads what Jobber's API exposes. Crew utilisation, hours by person, and cost or profit per job are not in there. Those need work beyond a connector, and that is covered at the bottom of this page.
 
@@ -96,6 +95,15 @@ You can also read the [measured cost of every tool](#cost-table) below. Those nu
 ## Setup
 
 Three steps, about fifteen minutes the first time.
+
+Clone this repository and build it first. This fork is published on GitHub, not npm.
+
+```bash
+git clone https://github.com/PineappleCare/jobber-mcp.git
+cd jobber-mcp
+npm ci
+npm run build
+```
 
 ### Step 1: Register a Jobber developer app
 
@@ -117,8 +125,8 @@ Add this inside `mcpServers`, using your own values:
 {
   "mcpServers": {
     "jobber": {
-      "command": "npx",
-      "args": ["-y", "@adeocode/jobber-mcp"],
+      "command": "node",
+      "args": ["/absolute/path/to/jobber-mcp/build/index.js"],
       "env": {
         "JOBBER_CLIENT_ID": "your-jobber-client-id",
         "JOBBER_CLIENT_SECRET": "your-jobber-client-secret"
@@ -130,7 +138,7 @@ Add this inside `mcpServers`, using your own values:
 
 If other servers are already configured, add a comma after the last one before adding this block. Then quit Claude Desktop completely and reopen it.
 
-**Claude Code:** `claude mcp add jobber -- npx -y @adeocode/jobber-mcp`
+**Claude Code:** `claude mcp add jobber -- node /absolute/path/to/jobber-mcp/build/index.js`
 
 **Cursor:** same JSON block, in Cursor's MCP settings.
 
@@ -166,10 +174,10 @@ ChatGPT's Developer mode and Microsoft Copilot Studio both require a server reac
 ```bash
 TRANSPORT=http \
 MCP_BASE_URL=https://your-host.example.com \
-MCP_API_KEY="$(openssl rand -hex 32)" \
+MCP_API_KEY=your-api-key \
 JOBBER_CLIENT_ID=your-client-id \
 JOBBER_CLIENT_SECRET=your-client-secret \
-npx -y @adeocode/jobber-mcp
+node build/index.js
 ```
 
 Read this before you expose it publicly. The server refuses to start in HTTP mode without `MCP_API_KEY`, because leaving it unset would open `/mcp`, and everything it can read from Jobber, to anyone who reaches the port. Set `MCP_ALLOW_NO_API_KEY=true` only when something else already enforces auth in front of it. `/mcp`, `/oauth/start` and `/oauth/callback` reject requests whose `Host` or `Origin` header does not match `MCP_BASE_URL`, as DNS-rebinding protection. Use HTTPS: the OAuth callback's binding cookie is only marked `Secure` when you do. Each session is bound to a hash of the API key presented when it was created, so a leaked `mcp-session-id` cannot be replayed on its own, and sessions are reaped after 30 minutes idle or 24 hours absolute. `/health` returns `{ok: true}` and nothing else.
@@ -200,12 +208,21 @@ Your assistant picks these automatically from the question. You never call them 
 | `logout` | Revokes at Jobber where possible, then clears the local tokens |
 | `get_audit_log` | Reads this server's own log of every call it has made, date-filtered and paginated |
 
+### Deliberate writes (disabled by default)
+
+These tools are registered only when `JOBBER_READ_ONLY=false`. The MCP host must display an interactive approval for every call. Start by probing them in a non-production Jobber account or against a controlled Williams record.
+
+| Tool | Inputs | What it does |
+|---|---|---|
+| `create_client` | first/last name, optional company name, `confirm_create: true` | Creates a basic client. Run `find_client` first; it does not add email, phone, or address yet. |
+| `update_client_company_name` | client ID, replacement name, `confirm_write: true` | Replaces the company name on a known client. On an ambiguous error, inspect Jobber before retrying. |
+
 ### Resources
 
 | URI | What it contains |
 |---|---|
 | `jobber://auth/status` | Live authentication state as JSON |
-| `jobber://safety/notice` | Plain-language notice that this connector is read-only, and where the audit log lives |
+| `jobber://safety/notice` | Plain-language notice about the default-safe scope and audit log |
 
 ### Pagination
 
@@ -245,7 +262,7 @@ Every variable is documented in [`.env.example`](.env.example). If you run the b
 | `JOBBER_GRAPHQL_URL` | no | Jobber's GraphQL endpoint | Also used by `logout`'s best-effort revocation, since Jobber has no separate revoke endpoint |
 | `JOBBER_GRAPHQL_VERSION` | no | `2025-04-16` | Pinned `X-JOBBER-GRAPHQL-VERSION`. Confirmed active in the Developer Center as of 2026-08-26. Recheck there before bumping |
 | `ENCRYPTION_KEY` | no | auto-generated | 64-hex-char AES-256 key, overriding the OS keychain. For CI and headless installs |
-| `JOBBER_READ_ONLY` | no | `true` | Blocks any write tool from registering. Version 1 has no write tools regardless |
+| `JOBBER_READ_ONLY` | no | `true` | Blocks write-tool registration. Set `false` only with per-call interactive approval |
 | `TRANSPORT` | no | `stdio` | `stdio` or `http` |
 | `MCP_BASE_URL` | in HTTP mode | - | Externally reachable base URL, used to build the OAuth redirect URI |
 | `PORT` | no | `3000` | HTTP transport port |

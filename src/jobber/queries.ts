@@ -309,3 +309,37 @@ export const ACCOUNT_ID_QUERY = /* GraphQL */ `
     }
   }
 `;
+
+// These mutations deliberately request only the small, stable response shape
+// needed by their tools. They are not an arbitrary GraphQL escape hatch.
+export const CREATE_CLIENT_MUTATION = /* GraphQL */ `
+  mutation CreateClient($input: ClientCreateInput!) {
+    clientCreate(input: $input) {
+      client {
+        id
+        name
+        companyName
+      }
+      userErrors {
+        message
+        path
+      }
+    }
+  }
+`;
+
+export const UPDATE_CLIENT_COMPANY_NAME_MUTATION = /* GraphQL */ `
+  mutation UpdateClientCompanyName($clientId: EncodedId!, $input: ClientEditInput!) {
+    clientEdit(clientId: $clientId, input: $input) {
+      client {
+        id
+        name
+        companyName
+      }
+      userErrors {
+        message
+        path
+      }
+    }
+  }
+`;

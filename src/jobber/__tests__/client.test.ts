@@ -15,6 +15,7 @@ vi.mock("../../utils/sessionContext.js", () => ({
 
 import {
   jobberGraphQL,
+  jobberGraphQLWrite,
   JobberApiError,
   JobberPermissionError,
   getGovernorForSession,
@@ -494,6 +495,40 @@ describe("jobberGraphQL - HTTP 5xx", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(JobberApiError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("jobberGraphQLWrite - ambiguous outcomes", () => {
+  it("never retries a 5xx mutation response because Jobber may have committed it", async () => {
+    mockRequireSessionContext.mockReturnValue(null);
+    mockGetValidAccessToken.mockResolvedValue("t");
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(500, {}));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(jobberGraphQLWrite("mutation { x }", undefined, 10)).rejects.toThrow(/outcome is unknown/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("never retries a rate-limited mutation response", async () => {
+    mockRequireSessionContext.mockReturnValue(null);
+    mockGetValidAccessToken.mockResolvedValue("t");
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(429, {}));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(jobberGraphQLWrite("mutation { x }", undefined, 10)).rejects.toThrow(/outcome is unknown/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("never retries a throttled mutation response", async () => {
+    mockRequireSessionContext.mockReturnValue(null);
+    mockGetValidAccessToken.mockResolvedValue("t");
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(200, { errors: [{ message: "Throttled", extensions: { code: "THROTTLED" } }] })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(jobberGraphQLWrite("mutation { x }", undefined, 10)).rejects.toThrow(/outcome is unknown/i);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
