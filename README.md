@@ -109,7 +109,7 @@ npm run build
 
 1. Go to [developer.getjobber.com](https://developer.getjobber.com) and sign in with a Jobber admin account.
 2. Create a new app. Name it something you will recognise, for example `Claude Connector`.
-3. Set the redirect URI to exactly `http://127.0.0.1:5679/callback`
+3. For a local stdio installation, leave the callback URL blank: Jobber supports `http://127.0.0.1:5679/callback` automatically and currently rejects adding it manually. For HTTP transport, register the deployed server's exact `https://.../oauth/callback` URL instead.
 4. Save, then copy the **Client ID** and **Client Secret**.
 
 ### Step 2: Add it to your AI client
