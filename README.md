@@ -32,9 +32,9 @@ visits, products/services, and assignable users.
 With `records` enabled, the server provides client, property, request, draft
 quote, job, and draft-invoice creation/update tools. With `scheduling`, it
 provides visit creation/update/completion and reviewed job close/reopen. With
-`communications`, it provides `send_invoice` and a Jobber quote transition
-tool. Jobber controls delivery to configured client contacts; no arbitrary
-recipient field is accepted.
+`communications`, it provides `mark_quote_sent` and `mark_invoice_sent`.
+These record an external send in Jobber; they do not deliver email. Use a
+separate approved mail tool for customer delivery.
 
 ## Local development
 
@@ -45,8 +45,16 @@ npm test
 ```
 
 Set `JOBBER_CLIENT_ID` and `JOBBER_CLIENT_SECRET`, then ask the MCP host to run
-`authenticate`. OAuth tokens are AES-256-GCM encrypted under `~/.jobber-mcp/`.
-Never commit tokens, client secrets, or an `.env` file.
+`authenticate`. OAuth tokens are AES-256-GCM encrypted under
+`JOBBER_STATE_DIR`, or `~/.jobber-mcp/` when that variable is unset. Container
+deployments must mount `JOBBER_STATE_DIR` on persistent storage and provide a
+stable `ENCRYPTION_KEY`. OAuth tokens and the audit log both live under that
+directory. Never commit tokens, client secrets, or an `.env` file.
+
+The included container image runs the authenticated streamable-HTTP transport.
+Set `TRANSPORT=http`, `MCP_BASE_URL`, `MCP_API_KEY`, and `PORT`, and expose only
+the `/mcp` endpoint to the intended MCP client. The image runs as an unprivileged
+user and expects `JOBBER_STATE_DIR` to be a writable persistent mount.
 
 `npm run schema:pull` downloads the currently configured Jobber GraphQL schema
 using the encrypted local OAuth session and writes a versioned public schema
@@ -60,6 +68,7 @@ npm test
 npm run lint
 npm run build
 npm run smoke
+npm run schema:validate
 npm run verify:version-sync
 npm run verify:no-secrets
 ```

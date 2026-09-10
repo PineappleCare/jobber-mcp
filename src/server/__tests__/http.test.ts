@@ -1,14 +1,23 @@
 import { vi, describe, it, expect, beforeEach } from "vitest";
 import { createHash } from "crypto";
 
-const { mockExchangeCodeForTokensPure, mockRefreshTokensPure } = vi.hoisted(() => ({
+const { mockExchangeCodeForTokensPure, mockRefreshTokensPure, mockLoadTokens, mockSaveTokens, mockClearTokens } = vi.hoisted(() => ({
   mockExchangeCodeForTokensPure: vi.fn(),
   mockRefreshTokensPure: vi.fn(),
+  mockLoadTokens: vi.fn().mockResolvedValue(null),
+  mockSaveTokens: vi.fn().mockResolvedValue(undefined),
+  mockClearTokens: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../../auth/oauth.js", () => ({
   exchangeCodeForTokensPure: mockExchangeCodeForTokensPure,
   refreshTokensPure: mockRefreshTokensPure,
+}));
+vi.mock("../../auth/tokenStorage.js", () => ({
+  loadTokens: mockLoadTokens,
+  saveTokens: mockSaveTokens,
+  clearTokens: mockClearTokens,
+  withTokenLock: async (fn: () => Promise<unknown>) => fn(),
 }));
 
 import { app, sessions, buildSessionContext, sweepStaleSessions } from "../http.js";
@@ -46,6 +55,7 @@ function hashAuthHeader(authHeader: string | undefined): string {
 beforeEach(() => {
   sessions.clear();
   vi.clearAllMocks();
+  mockLoadTokens.mockResolvedValue(null);
   delete process.env.MCP_API_KEY;
   delete process.env.MCP_BASE_URL;
   delete process.env.MCP_ALLOWED_ORIGINS;
@@ -184,6 +194,7 @@ describe("GET /oauth/callback", () => {
     expect(await callbackRes.text()).toMatch(/Authentication Successful/);
     expect(mockExchangeCodeForTokensPure).toHaveBeenCalledWith("abc123", expect.stringContaining("/oauth/callback"), undefined);
     expect(sessions.get(id)?.tokens?.access_token).toBe("at");
+    expect(mockSaveTokens).toHaveBeenCalledWith(expect.objectContaining({ access_token: "at", refresh_token: "rt" }));
     expect(sessions.get(id)?.pendingOAuthNonce).toBeNull();
   });
 
@@ -257,6 +268,28 @@ describe("buildSessionContext - getAccessToken refresh-on-expiry", () => {
     expect(accessToken).toBe("AT-refreshed");
     expect(mockRefreshTokensPure).toHaveBeenCalledWith("RT-old");
     expect(record.tokens?.access_token).toBe("AT-refreshed");
+    expect(mockSaveTokens).toHaveBeenCalledWith(expect.objectContaining({ access_token: "AT-refreshed" }));
+  });
+
+  it("hydrates a new HTTP session from encrypted persistent tokens", async () => {
+    const persisted = {
+      access_token: "AT-persisted",
+      refresh_token: "RT-persisted",
+      expires_at: Date.now() + 60 * 60 * 1000,
+      account_id: "account-1",
+    };
+    mockLoadTokens.mockResolvedValue(persisted);
+    const record: SessionRecord = {
+      transport: fakeTransport(), mcpServer: null, tokens: null,
+      pendingOAuthNonce: null, pendingCodeVerifier: null, pendingAuthorizeUrl: null,
+      createdAt: Date.now(), lastActivityAt: Date.now(), apiKeyHash: hashAuthHeader(undefined),
+      refreshInFlight: null, accountId: undefined,
+    };
+
+    const accessToken = await buildSessionContext(record, "session-1").getAccessToken();
+
+    expect(accessToken).toBe("AT-persisted");
+    expect(record.tokens).toEqual(persisted);
   });
 
   it("does not refresh a token that still has more than 5 minutes left", async () => {

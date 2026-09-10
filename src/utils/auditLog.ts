@@ -7,9 +7,15 @@ import { requireSessionContext } from "./sessionContext.js";
 
 const STDIO_SESSION_ID = randomUUID();
 
-const AUDIT_DIR = path.join(os.homedir(), ".jobber-mcp");
-const AUDIT_FILE = path.join(AUDIT_DIR, "audit.log");
-const AUDIT_FILE_ROTATED = path.join(AUDIT_DIR, "audit.log.1");
+function auditPaths() {
+  const configured = (process.env.JOBBER_STATE_DIR ?? "").trim();
+  const directory = configured ? path.resolve(configured) : path.join(os.homedir(), ".jobber-mcp");
+  return {
+    directory,
+    file: path.join(directory, "audit.log"),
+    rotatedFile: path.join(directory, "audit.log.1"),
+  };
+}
 // Single-generation rotation, not a full logrotate reimplementation - this just stops the file
 // from growing forever. Checked before each append, so the file can briefly exceed this by up to
 // one entry's worth of bytes.
@@ -31,6 +37,29 @@ const HASHED_KEYS = new Set([
   "first_name",
   "last_name",
   "company_name",
+  "name",
+  "title",
+  "subject",
+  "email",
+  "emails",
+  "phone",
+  "phones",
+  "number",
+  "address",
+  "billing_address",
+  "street1",
+  "street2",
+  "city",
+  "province",
+  "postal_code",
+  "postalCode",
+  "message",
+  "instructions",
+  "description",
+  "contract_disclaimer",
+  "contractDisclaimer",
+  "line_items",
+  "lineItems",
 ]);
 
 function normalizeKey(k: string): string {
@@ -41,7 +70,23 @@ const REDACTED_KEYS_NORMALIZED = new Set([...REDACTED_KEYS].map(normalizeKey));
 const HASHED_KEYS_NORMALIZED = new Set([...HASHED_KEYS].map(normalizeKey));
 
 function hashValue(v: unknown): string {
-  return createHash("sha256").update(String(v)).digest("hex").slice(0, 12);
+  // JSON preserves distinctions between structured values which String()
+  // collapses (for example every object becomes "[object Object]"). Keys are
+  // sorted recursively so semantically identical inputs correlate even if a
+  // caller supplied their properties in a different order.
+  const canonicalize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (value !== null && typeof value === "object") {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([key, nested]) => [key, canonicalize(nested)])
+      );
+    }
+    return value;
+  };
+  const serialized = JSON.stringify(canonicalize(v)) ?? String(v);
+  return createHash("sha256").update(serialized).digest("hex").slice(0, 12);
 }
 
 function detectMachineIp(): string | undefined {
@@ -83,10 +128,11 @@ export interface ReadAuditLogResult {
  * size threshold, so the next appendFile starts a fresh file. Best-effort - a failure here must
  * not block the append that triggered it. */
 async function rotateIfNeeded(): Promise<void> {
+  const { file, rotatedFile } = auditPaths();
   try {
-    const stat = await fs.stat(AUDIT_FILE);
+    const stat = await fs.stat(file);
     if (stat.size < AUDIT_ROTATE_MAX_BYTES) return;
-    await fs.rename(AUDIT_FILE, AUDIT_FILE_ROTATED);
+    await fs.rename(file, rotatedFile);
   } catch (err: any) {
     if (err.code !== "ENOENT") console.error(`[audit] WARNING: log rotation check failed: ${err.message}`);
   }
@@ -122,8 +168,9 @@ export async function appendAuditLog(
   entry: Omit<AuditEntry, "timestamp" | "session_id" | "machine_ip" | "account_id"> & { account_id?: string; result_count?: number }
 ): Promise<void> {
   try {
-    await fs.mkdir(AUDIT_DIR, { recursive: true, mode: 0o700 });
-    await fs.chmod(AUDIT_DIR, 0o700).catch(() => {});
+    const { directory, file } = auditPaths();
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    await fs.chmod(directory, 0o700).catch(() => {});
 
     const ctx = requireSessionContext();
     // `""` is http.ts's initialize-request placeholder sessionId, never a real one - `||` (not
@@ -152,8 +199,8 @@ export async function appendAuditLog(
     };
 
     await rotateIfNeeded();
-    await fs.appendFile(AUDIT_FILE, JSON.stringify(full) + "\n", "utf8");
-    await fs.chmod(AUDIT_FILE, 0o600).catch(() => {});
+    await fs.appendFile(file, JSON.stringify(full) + "\n", "utf8");
+    await fs.chmod(file, 0o600).catch(() => {});
   } catch (err: any) {
     console.error(`[audit] WARNING: Failed to write audit log: ${err.message}`);
   }
@@ -165,7 +212,7 @@ export async function readAuditLog(filter: AuditLogFilter = {}): Promise<ReadAud
 
   let raw: string;
   try {
-    raw = await fs.readFile(AUDIT_FILE, "utf8");
+    raw = await fs.readFile(auditPaths().file, "utf8");
   } catch (err: any) {
     if (err.code === "ENOENT") return { entries: [], total_matched: 0, truncated: false, corrupted_lines: 0 };
     throw err;

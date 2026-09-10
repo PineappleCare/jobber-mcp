@@ -11,6 +11,7 @@ import { sessionStorage } from "../utils/sessionContext.js";
 import type { SessionContext } from "../utils/sessionContext.js";
 import { appendAuditLog } from "../utils/auditLog.js";
 import { clearGovernorForSession } from "../jobber/client.js";
+import { clearTokens, loadTokens, saveTokens, withTokenLock } from "../auth/tokenStorage.js";
 
 const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
 
@@ -42,13 +43,22 @@ function createMcpServer(): McpServer {
 
 async function doGetAccessToken(record: SessionRecord): Promise<string> {
   if (!record.tokens) {
-    throw new Error(
-      "Not authenticated. Call the 'authenticate' tool to get a login URL, complete OAuth in your browser, then try again."
-    );
+    record.tokens = await loadTokens();
+    if (!record.tokens) {
+      throw new Error(
+        "Not authenticated. Call the 'authenticate' tool to get a login URL, complete OAuth in your browser, then try again."
+      );
+    }
   }
   if (Date.now() > record.tokens.expires_at - 5 * 60 * 1000) {
-    const refreshed = await refreshTokensPure(record.tokens.refresh_token);
-    record.tokens = { ...refreshed, account_id: record.tokens.account_id };
+    record.tokens = await withTokenLock(async () => {
+      const persisted = (await loadTokens()) ?? record.tokens!;
+      if (Date.now() <= persisted.expires_at - 5 * 60 * 1000) return persisted;
+      const refreshed = await refreshTokensPure(persisted.refresh_token);
+      const durable = { ...refreshed, account_id: persisted.account_id };
+      await saveTokens(durable);
+      return durable;
+    });
   }
   return record.tokens.access_token;
 }
@@ -68,9 +78,9 @@ export function buildSessionContext(record: SessionRecord, sessionId: string): S
         record.refreshInFlight = null;
       }
     },
-    storeTokens: (tokens: JobberTokens) => { record.tokens = tokens; },
+    storeTokens: async (tokens: JobberTokens) => { record.tokens = tokens; await saveTokens(tokens); },
     getTokens: () => record.tokens,
-    clearTokens: () => { record.tokens = null; },
+    clearTokens: async () => { record.tokens = null; await clearTokens(); },
     setPendingNonce: (nonce: string) => { record.pendingOAuthNonce = nonce; },
     setPendingCodeVerifier: (codeVerifier: string) => { record.pendingCodeVerifier = codeVerifier; },
     setPendingAuthorizeUrl: (url: string) => { record.pendingAuthorizeUrl = url; },
@@ -212,6 +222,8 @@ app.all("/mcp", async (c) => {
       const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: async (sessionId) => {
+          record.tokens = await loadTokens();
+          record.accountId = record.tokens?.account_id;
           record.mcpServer = createMcpServer();
           sessions.set(sessionId, record);
           await record.mcpServer.connect(transport);
@@ -357,6 +369,7 @@ app.get("/oauth/callback", async (c) => {
     const redirectUri = `${(process.env.MCP_BASE_URL ?? "").trim()}/oauth/callback`;
     const tokens = await exchangeCodeForTokensPure(code, redirectUri, codeVerifier);
     record.tokens = tokens;
+    await saveTokens(tokens);
 
     const ctx = buildSessionContext(record, sessionId);
     await sessionStorage.run(ctx, () =>

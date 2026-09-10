@@ -1,0 +1,10 @@
+.git
+.github
+.env
+.jobber-mcp
+build
+coverage
+node_modules
+schema
+scripts
+*.log

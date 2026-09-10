@@ -33,7 +33,9 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
       - run: npm ci
+      - run: npm run schema:validate
       - run: npm run build
       - run: npm run smoke
       - run: npm run verify:version-sync
       - run: npm run verify:no-secrets
+      - run: npm audit --audit-level=high

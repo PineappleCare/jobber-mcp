@@ -110,7 +110,7 @@ export function registerAuthTools(server: McpServer): void {
           await revokeToken(tokens.access_token).catch(() => {});
         }
         if (ctx) {
-          ctx.clearTokens();
+          await ctx.clearTokens();
         } else {
           await clearTokens();
         }

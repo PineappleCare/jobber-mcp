@@ -5,10 +5,16 @@ import os from "os";
 import { Entry } from "@napi-rs/keyring";
 import type { JobberTokens } from "./oauth.js";
 
-const TOKEN_DIR = path.join(os.homedir(), ".jobber-mcp");
-const TOKEN_FILE = path.join(TOKEN_DIR, "tokens.enc");
-const KEY_FILE = path.join(TOKEN_DIR, "key.hex");
-const LOCK_FILE = path.join(TOKEN_DIR, "tokens.lock");
+function tokenPaths() {
+  const configured = (process.env.JOBBER_STATE_DIR ?? "").trim();
+  const directory = configured ? path.resolve(configured) : path.join(os.homedir(), ".jobber-mcp");
+  return {
+    directory,
+    tokenFile: path.join(directory, "tokens.enc"),
+    keyFile: path.join(directory, "key.hex"),
+    lockFile: path.join(directory, "tokens.lock"),
+  };
+}
 
 const ALGORITHM = "aes-256-gcm";
 const IV_LENGTH = 12; // NIST SP 800-38D recommends 96-bit GCM nonces
@@ -25,6 +31,7 @@ const LOCK_RETRY_MS = 50;
 const LOCK_TIMEOUT_MS = 10_000;
 
 export async function getEncryptionKey(): Promise<Buffer> {
+  const { directory, keyFile } = tokenPaths();
   const envKey = process.env.ENCRYPTION_KEY;
 
   // 1. Env var override (CI/headless, backward compat)
@@ -60,28 +67,29 @@ export async function getEncryptionKey(): Promise<Buffer> {
   }
 
   // 3. File fallback: ~/.jobber-mcp/key.hex (mode 0600) - WSL2 / headless Linux
-  await fs.mkdir(TOKEN_DIR, { recursive: true, mode: 0o700 });
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
   // mkdir's mode is a no-op when the directory already existed with looser permissions - repair it.
-  await fs.chmod(TOKEN_DIR, 0o700).catch(() => {});
+  await fs.chmod(directory, 0o700).catch(() => {});
   try {
-    const keyHex = (await fs.readFile(KEY_FILE, "utf8")).trim();
+    const keyHex = (await fs.readFile(keyFile, "utf8")).trim();
     // Same repair as above: writeFile's {mode} option only applies at creation, so re-apply it on
     // every read in case an older version of this code (or a restored backup) left it looser.
-    await fs.chmod(KEY_FILE, 0o600).catch(() => {});
+    await fs.chmod(keyFile, 0o600).catch(() => {});
     return Buffer.from(keyHex, "hex");
   } catch (err: any) {
     if (err.code !== "ENOENT") throw err;
   }
   const keyHex = crypto.randomBytes(32).toString("hex");
-  await fs.writeFile(KEY_FILE, keyHex, { mode: 0o600 });
-  await fs.chmod(KEY_FILE, 0o600).catch(() => {});
-  console.error("[tokenStorage] OS keychain unavailable. Generated encryption key at ~/.jobber-mcp/key.hex (mode 0600).");
+  await fs.writeFile(keyFile, keyHex, { mode: 0o600 });
+  await fs.chmod(keyFile, 0o600).catch(() => {});
+  console.error(`[tokenStorage] OS keychain unavailable. Generated encryption key in ${directory} (mode 0600).`);
   return Buffer.from(keyHex, "hex");
 }
 
 export async function saveTokens(tokens: JobberTokens): Promise<void> {
-  await fs.mkdir(TOKEN_DIR, { recursive: true, mode: 0o700 });
-  await fs.chmod(TOKEN_DIR, 0o700);
+  const { directory, tokenFile } = tokenPaths();
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  await fs.chmod(directory, 0o700);
 
   const key = await getEncryptionKey();
   const iv = crypto.randomBytes(IV_LENGTH);
@@ -94,16 +102,17 @@ export async function saveTokens(tokens: JobberTokens): Promise<void> {
   const combined = Buffer.concat([iv, authTag, encrypted]);
   // Write to a temp file then rename, so a crash mid-write can never leave TOKEN_FILE truncated -
   // fs.rename is atomic on the same filesystem, and readers only ever see the old or new content.
-  const tmpFile = `${TOKEN_FILE}.tmp-${process.pid}`;
+  const tmpFile = `${tokenFile}.tmp-${process.pid}`;
   await fs.writeFile(tmpFile, combined, { mode: 0o600 });
   await fs.chmod(tmpFile, 0o600);
-  await fs.rename(tmpFile, TOKEN_FILE);
+  await fs.rename(tmpFile, tokenFile);
 }
 
 export async function loadTokens(): Promise<JobberTokens | null> {
+  const { tokenFile } = tokenPaths();
   let combined: Buffer;
   try {
-    combined = await fs.readFile(TOKEN_FILE);
+    combined = await fs.readFile(tokenFile);
   } catch (err: any) {
     if (err.code === "ENOENT") return null;
     throw err;
@@ -131,8 +140,9 @@ export async function loadTokens(): Promise<JobberTokens | null> {
 }
 
 export async function clearTokens(): Promise<void> {
+  const { tokenFile } = tokenPaths();
   try {
-    await fs.unlink(TOKEN_FILE);
+    await fs.unlink(tokenFile);
   } catch (err: any) {
     if (err.code !== "ENOENT") throw err; // ENOENT = already gone, that's fine
   }
@@ -146,21 +156,22 @@ export async function clearTokens(): Promise<void> {
  * since another process may have refreshed and saved while this one was waiting.
  */
 export async function withTokenLock<T>(fn: () => Promise<T>): Promise<T> {
-  await fs.mkdir(TOKEN_DIR, { recursive: true, mode: 0o700 });
+  const { directory, lockFile } = tokenPaths();
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
   const start = Date.now();
 
   for (;;) {
     try {
-      const handle = await fs.open(LOCK_FILE, "wx");
+      const handle = await fs.open(lockFile, "wx");
       await handle.close();
       break;
     } catch (err: any) {
       if (err.code !== "EEXIST") throw err;
 
       try {
-        const stat = await fs.stat(LOCK_FILE);
+        const stat = await fs.stat(lockFile);
         if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
-          await fs.unlink(LOCK_FILE).catch(() => {});
+          await fs.unlink(lockFile).catch(() => {});
           continue;
         }
       } catch {
@@ -179,6 +190,6 @@ export async function withTokenLock<T>(fn: () => Promise<T>): Promise<T> {
   try {
     return await fn();
   } finally {
-    await fs.unlink(LOCK_FILE).catch(() => {});
+    await fs.unlink(lockFile).catch(() => {});
   }
 }

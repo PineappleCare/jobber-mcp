@@ -52,6 +52,7 @@ function toJSONL(...entries: object[]): string {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  delete process.env.JOBBER_STATE_DIR;
 });
 
 describe("readAuditLog", () => {
@@ -222,11 +223,51 @@ describe("appendAuditLog redaction", () => {
     expect(first.args.search_term_hash).toBe(second.args.search_term_hash);
   });
 
+  it("hashes structured values canonically instead of collapsing every object to the same hash", async () => {
+    await appendAuditLog({ tool: "create_client", args: { billing_address: { city: "Toronto", street1: "1 A St" } }, outcome: "success" });
+    await appendAuditLog({ tool: "create_client", args: { billing_address: { street1: "1 A St", city: "Toronto" } }, outcome: "success" });
+    await appendAuditLog({ tool: "create_client", args: { billing_address: { city: "Ottawa", street1: "2 B St" } }, outcome: "success" });
+    const first = JSON.parse(mockAppendFile.mock.calls[0][1] as string);
+    const reordered = JSON.parse(mockAppendFile.mock.calls[1][1] as string);
+    const different = JSON.parse(mockAppendFile.mock.calls[2][1] as string);
+    expect(first.args.billing_address_hash).toBe(reordered.args.billing_address_hash);
+    expect(first.args.billing_address_hash).not.toBe(different.args.billing_address_hash);
+  });
+
+  it("never stores operational customer data in plaintext", async () => {
+    await appendAuditLog({
+      tool: "create_draft_quote",
+      args: {
+        email: "customer@example.com",
+        phone: "+1 416 555 0100",
+        billing_address: { street1: "1 Private Street", city: "Toronto", postal_code: "M1M 1M1" },
+        message: "Private customer message",
+        instructions: "Private site instructions",
+        line_items: [{ name: "Sensitive service", description: "Sensitive details" }],
+      },
+      outcome: "success",
+    });
+    const serialized = mockAppendFile.mock.calls[0][1] as string;
+    for (const plaintext of ["customer@example.com", "416 555", "Private Street", "Private customer", "Private site", "Sensitive service", "Sensitive details"]) {
+      expect(serialized).not.toContain(plaintext);
+    }
+    const written = JSON.parse(serialized);
+    expect(written.args.email_hash).toMatch(/^[0-9a-f]{12}$/);
+    expect(written.args.line_items_hash).toMatch(/^[0-9a-f]{12}$/);
+  });
+
   it("creates the audit directory and file with owner-only permissions", async () => {
     await appendAuditLog({ tool: "find_client", args: {}, outcome: "success" });
     expect(mockMkdir).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ mode: 0o700 }));
     expect(mockChmod).toHaveBeenCalledWith(expect.any(String), 0o700);
     expect(mockChmod).toHaveBeenCalledWith(expect.any(String), 0o600);
+  });
+
+  it("stores audit data in JOBBER_STATE_DIR for container persistence", async () => {
+    process.env.JOBBER_STATE_DIR = "/opt/data/jobber-state";
+    await appendAuditLog({ tool: "find_client", args: {}, outcome: "success" });
+    expect(mockMkdir).toHaveBeenCalledWith("/opt/data/jobber-state", expect.objectContaining({ mode: 0o700 }));
+    expect(mockAppendFile).toHaveBeenCalledWith("/opt/data/jobber-state/audit.log", expect.any(String), "utf8");
   });
 
   it("redacts camelCase secret-like keys", async () => {

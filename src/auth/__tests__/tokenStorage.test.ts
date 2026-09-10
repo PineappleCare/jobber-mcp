@@ -60,6 +60,7 @@ function makeKeychainUnavailable() {
 beforeEach(() => {
   vi.clearAllMocks();
   delete process.env.ENCRYPTION_KEY;
+  delete process.env.JOBBER_STATE_DIR;
   MockEntry.mockImplementation(function () {
     return { getPassword: mockGetPassword, setPassword: mockSetPassword };
   });
@@ -201,6 +202,13 @@ describe("saveTokens / loadTokens / clearTokens", () => {
       expect.any(Buffer),
       { mode: 0o600 },
     );
+  });
+
+  it("uses JOBBER_STATE_DIR for container-persistent state", async () => {
+    process.env.JOBBER_STATE_DIR = "/opt/data/jobber-state";
+    await saveTokens(tokens);
+    expect(mockMkdir).toHaveBeenCalledWith("/opt/data/jobber-state", { recursive: true, mode: 0o700 });
+    expect(mockWriteFile.mock.calls[0][0]).toMatch(/^\/opt\/data\/jobber-state\/tokens\.enc\.tmp-/);
   });
 
   it("writes to a temp file and renames it into place, never writing tokens.enc directly", async () => {

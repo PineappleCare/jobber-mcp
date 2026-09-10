@@ -4,9 +4,9 @@ import type { JobberTokens } from "../auth/oauth.js";
 export interface SessionContext {
   sessionId: string;
   getAccessToken(): Promise<string>;
-  storeTokens(tokens: JobberTokens): void;
+  storeTokens(tokens: JobberTokens): void | Promise<void>;
   getTokens(): JobberTokens | null;
-  clearTokens(): void;
+  clearTokens(): void | Promise<void>;
   setPendingNonce(nonce: string): void;
   setPendingCodeVerifier(codeVerifier: string): void;
   setPendingAuthorizeUrl(url: string): void;
