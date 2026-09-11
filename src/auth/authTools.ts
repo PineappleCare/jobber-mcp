@@ -10,20 +10,74 @@ export function registerAuthTools(server: McpServer): void {
     { description: "Check whether the connector is authenticated with Jobber and when the token expires" },
     async () => {
       const ctx = requireSessionContext();
-      const tokens = ctx ? ctx.getTokens() : await loadTokens();
+      let tokens = ctx ? ctx.getTokens() : await loadTokens();
+
+      if (!tokens) {
+        await appendAuditLog({ tool: "auth_status", args: {}, outcome: "success" });
+        return {
+          content: [{ type: "text", text: JSON.stringify({ authenticated: false }) }],
+        };
+      }
+
+      // HTTP transports keep token state per MCP session. Another session may have refreshed and
+      // persisted a rotated token while this one still holds the expired copy it loaded during
+      // initialization. Use the normal access-token path whenever expiry is near: it re-reads the
+      // encrypted token file under the refresh lock, adopts a newer persisted token when present,
+      // and refreshes only when necessary. Without this, auth_status can falsely claim that Jobber
+      // needs re-authentication even while real API tools are working through another session.
+      if (Date.now() > tokens.expires_at - 5 * 60 * 1000) {
+        const previousAccountId = tokens.account_id;
+        const previousExpiry = tokens.expires_at;
+        try {
+          if (ctx) {
+            await ctx.getAccessToken();
+            tokens = ctx.getTokens();
+          } else {
+            await getValidAccessToken();
+            tokens = await loadTokens();
+          }
+        } catch {
+          await appendAuditLog({
+            tool: "auth_status",
+            args: {},
+            outcome: "error",
+            account_id: previousAccountId,
+            error_message: "Token refresh failed",
+          });
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                authenticated: false,
+                token_expired: Date.now() >= previousExpiry,
+                refresh_failed: true,
+                warning: "Token refresh failed. Run the 'authenticate' tool to reconnect Jobber.",
+              }),
+            }],
+            isError: true,
+          };
+        }
+      }
+
+      if (!tokens) {
+        await appendAuditLog({
+          tool: "auth_status",
+          args: {},
+          outcome: "error",
+          error_message: "Token state unavailable after refresh",
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify({ authenticated: false }) }],
+          isError: true,
+        };
+      }
 
       await appendAuditLog({
         tool: "auth_status",
         args: {},
         outcome: "success",
-        account_id: tokens?.account_id,
+        account_id: tokens.account_id,
       });
-
-      if (!tokens) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ authenticated: false }) }],
-        };
-      }
 
       const expiresIn = Math.floor((tokens.expires_at - Date.now()) / 1000 / 60);
       const token_expired = expiresIn < 0;

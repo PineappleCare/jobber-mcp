@@ -318,6 +318,41 @@ describe("buildSessionContext - getAccessToken refresh-on-expiry", () => {
     expect(mockRefreshTokensPure).not.toHaveBeenCalled();
   });
 
+  it("adopts a fresh token persisted by another session instead of refreshing its stale copy", async () => {
+    const persisted = {
+      access_token: "AT-from-other-session",
+      refresh_token: "RT-from-other-session",
+      expires_at: Date.now() + 60 * 60 * 1000,
+      account_id: "account-1",
+    };
+    mockLoadTokens.mockResolvedValue(persisted);
+    const record: SessionRecord = {
+      transport: fakeTransport(),
+      mcpServer: null,
+      tokens: {
+        access_token: "AT-stale",
+        refresh_token: "RT-stale",
+        expires_at: Date.now() - 60 * 1000,
+        account_id: "account-1",
+      },
+      pendingOAuthNonce: null,
+      pendingCodeVerifier: null,
+      pendingAuthorizeUrl: null,
+      createdAt: Date.now(),
+      lastActivityAt: Date.now(),
+      apiKeyHash: hashAuthHeader(undefined),
+      refreshInFlight: null,
+      accountId: "account-1",
+    };
+
+    const accessToken = await buildSessionContext(record, "session-stale").getAccessToken();
+
+    expect(accessToken).toBe("AT-from-other-session");
+    expect(record.tokens).toEqual(persisted);
+    expect(mockRefreshTokensPure).not.toHaveBeenCalled();
+    expect(mockSaveTokens).not.toHaveBeenCalled();
+  });
+
   it("reads and writes the account id through the underlying session record", () => {
     const record: SessionRecord = {
       transport: fakeTransport(),
