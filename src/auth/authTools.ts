@@ -10,20 +10,71 @@ export function registerAuthTools(server: McpServer): void {
     { description: "Check whether the connector is authenticated with Jobber and when the token expires" },
     async () => {
       const ctx = requireSessionContext();
-      const tokens = ctx ? ctx.getTokens() : await loadTokens();
+      let tokens = ctx ? ctx.getTokens() : await loadTokens();
+
+      if (!tokens) {
+        await appendAuditLog({ tool: "auth_status", args: {}, outcome: "success" });
+        return {
+          content: [{ type: "text", text: JSON.stringify({ authenticated: false }) }],
+        };
+      }
+
+      // Checking status should use the same refresh path as an API call. Otherwise a healthy
+      // connection is reported as expired as soon as its short-lived access token ages out, even
+      // though its refresh token is still valid and the next API call would succeed.
+      if (Date.now() > tokens.expires_at - 5 * 60 * 1000) {
+        const previousAccountId = tokens.account_id;
+        const previousExpiry = tokens.expires_at;
+        try {
+          if (ctx) {
+            await ctx.getAccessToken();
+            tokens = ctx.getTokens();
+          } else {
+            await getValidAccessToken();
+            tokens = await loadTokens();
+          }
+        } catch {
+          await appendAuditLog({
+            tool: "auth_status",
+            args: {},
+            outcome: "error",
+            account_id: previousAccountId,
+            error_message: "Token refresh failed",
+          });
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                authenticated: false,
+                token_expired: Date.now() >= previousExpiry,
+                refresh_failed: true,
+                warning: "Token refresh failed. Run the 'authenticate' tool to reconnect Jobber.",
+              }),
+            }],
+            isError: true,
+          };
+        }
+      }
+
+      if (!tokens) {
+        await appendAuditLog({
+          tool: "auth_status",
+          args: {},
+          outcome: "error",
+          error_message: "Token state unavailable after refresh",
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify({ authenticated: false }) }],
+          isError: true,
+        };
+      }
 
       await appendAuditLog({
         tool: "auth_status",
         args: {},
         outcome: "success",
-        account_id: tokens?.account_id,
+        account_id: tokens.account_id,
       });
-
-      if (!tokens) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ authenticated: false }) }],
-        };
-      }
 
       const expiresIn = Math.floor((tokens.expires_at - Date.now()) / 1000 / 60);
       const token_expired = expiresIn < 0;

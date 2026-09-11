@@ -87,18 +87,73 @@ describe("auth_status", () => {
     expect(parsed.token_expires_in_minutes).toBeGreaterThanOrEqual(29);
   });
 
-  it("flags an expired token with a warning", async () => {
+  it("refreshes an expired stdio token before reporting status", async () => {
     mockRequireSessionContext.mockReturnValue(null);
-    mockLoadTokens.mockResolvedValue({
-      access_token: "at",
-      refresh_token: "rt",
-      expires_at: Date.now() - 60 * 1000,
-    });
+    mockLoadTokens
+      .mockResolvedValueOnce({
+        access_token: "at-old",
+        refresh_token: "rt-old",
+        expires_at: Date.now() - 60 * 1000,
+      })
+      .mockResolvedValueOnce({
+        access_token: "at-new",
+        refresh_token: "rt-new",
+        expires_at: Date.now() + 60 * 60 * 1000,
+      });
+    mockGetValidAccessToken.mockResolvedValue("at-new");
 
     const result = await handlers["auth_status"]();
     const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.token_expired).toBe(true);
+    expect(mockGetValidAccessToken).toHaveBeenCalledOnce();
+    expect(parsed.authenticated).toBe(true);
+    expect(parsed.token_expired).toBe(false);
+  });
+
+  it("refreshes an expired HTTP session before reporting status", async () => {
+    const expired = {
+      access_token: "at",
+      refresh_token: "rt",
+      expires_at: Date.now() - 60 * 1000,
+    };
+    const refreshed = {
+      access_token: "at-new",
+      refresh_token: "rt-new",
+      expires_at: Date.now() + 60 * 60 * 1000,
+    };
+    const ctx = fakeCtx({
+      getAccessToken: vi.fn().mockResolvedValue("at-new"),
+      getTokens: vi.fn().mockReturnValueOnce(expired).mockReturnValue(refreshed),
+    });
+    mockRequireSessionContext.mockReturnValue(ctx);
+
+    const result = await handlers["auth_status"]();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(ctx.getAccessToken).toHaveBeenCalledOnce();
+    expect(parsed.authenticated).toBe(true);
+    expect(parsed.token_expired).toBe(false);
+  });
+
+  it("reports a real refresh failure as an authentication error", async () => {
+    const expired = {
+      access_token: "at",
+      refresh_token: "rt",
+      expires_at: Date.now() - 60 * 1000,
+    };
+    const ctx = fakeCtx({
+      getAccessToken: vi.fn().mockRejectedValue(new Error("invalid_grant")),
+      getTokens: vi.fn().mockReturnValue(expired),
+    });
+    mockRequireSessionContext.mockReturnValue(ctx);
+
+    const result = await handlers["auth_status"]();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(result.isError).toBe(true);
+    expect(parsed.authenticated).toBe(false);
+    expect(parsed.refresh_failed).toBe(true);
     expect(parsed.warning).toMatch(/authenticate/i);
+    expect(mockAppendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({ tool: "auth_status", outcome: "error", error_message: "Token refresh failed" })
+    );
   });
 
   it("reads tokens from the session context in HTTP mode", async () => {
