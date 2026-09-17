@@ -31,7 +31,11 @@ visits, products/services, and assignable users.
 
 With `records` enabled, the server provides client, property, request, draft
 quote, job, and draft-invoice creation/update tools. With `scheduling`, it
-provides visit creation/update/completion and reviewed job close/reopen. With
+provides visit creation/update/completion and reviewed job close/reopen.
+Visit schedules use an explicit `mode`: `anytime` for a date without a time,
+`timed` for exact start/end times, or `unscheduled` for no date. Use
+`create_visits` to create 1-20 reviewed visits for one job in one mutation;
+the result reports and verifies each visit separately. With
 `communications`, it provides `mark_quote_sent` and `mark_invoice_sent`.
 These record an external send in Jobber; they do not deliver email. Use a
 separate approved mail tool for customer delivery.

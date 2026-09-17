@@ -148,6 +148,18 @@ function auditValidationFailures<T extends z.ZodTypeAny>(schema: T, toolName: st
   }) as T;
 }
 
+function toolErrorPayload(message: string): string {
+  const lower = message.toLowerCase();
+  const errorType = lower.includes("outcome is unknown") || lower.includes("outcome may be unknown")
+    ? "outcome_uncertain"
+    : lower.startsWith("jobber rejected")
+      ? "jobber_rejected"
+      : lower.includes("jobber api request failed") || lower.includes("access token was rejected") || lower.includes("authenticate tool")
+        ? "connection_unavailable"
+        : "invalid_request";
+  return JSON.stringify({ outcome: "error", error_type: errorType, error: message });
+}
+
 /**
  * Registers a read-only tool. Wraps the handler with the standard
  * try/audit-log/catch boilerplate shared by every v1 tool.
@@ -195,7 +207,7 @@ function registerTool<
       } catch (err: any) {
         await appendAuditLog({ tool: name, args: args ?? {}, outcome: "error", error_message: err.message });
         return {
-          content: [{ type: "text", text: `Error: ${err.message}` }],
+          content: [{ type: "text", text: toolErrorPayload(err.message) }],
           isError: true,
         };
       }

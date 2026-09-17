@@ -173,6 +173,7 @@ describe("registerReadOnlyTool", () => {
     const result = await server.handlers["find_client"]({ search_term: "Acme" });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("upstream failure");
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ outcome: "error", error_type: "invalid_request" });
     expect(mockAppendAuditLog).toHaveBeenCalledWith(
       expect.objectContaining({ tool: "find_client", outcome: "error", error_message: "upstream failure", args: { search_term: "Acme" } })
     );
@@ -223,7 +224,7 @@ describe("registerReadOnlyTool cost enforcement", () => {
     );
     const result = await server.handlers["client_history"]({});
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('no maxCost declared for cost key "nonexistent"');
+    expect(JSON.parse(result.content[0].text).error).toContain('no maxCost declared for cost key "nonexistent"');
     expect(mockJobberGraphQL).not.toHaveBeenCalled();
   });
 });

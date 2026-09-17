@@ -39,7 +39,7 @@ const requestFields = `${summaryFields} title requestStatus createdAt client { i
 const quoteFields = `${summaryFields} quoteNumber title quoteStatus sentAt message amounts { total } client { id name } property { id name }`;
 const jobFields = `${summaryFields} jobNumber title jobStatus instructions total client { id name } property { id name } quote { id } request { id }`;
 const invoiceFields = `${summaryFields} invoiceNumber subject invoiceStatus issuedDate dueDate receivedDate amounts { total invoiceBalance } client { id name }`;
-const visitFields = `id title visitStatus isComplete completedAt startAt endAt instructions job { id jobNumber title } client { id name } assignedUsers(first: 20) { nodes { id name { full } } }`;
+const visitFields = `id title visitStatus isComplete completedAt allDay startAt endAt instructions job { id jobNumber title } client { id name } assignedUsers(first: 20) { nodes { id name { full } } }`;
 
 const SEARCHES: Record<z.infer<typeof recordTypeSchema>, string> = {
   client: `query SearchClients($term:String,$first:Int!,$after:String){ clients(searchTerm:$term,first:$first,after:$after){ totalCount nodes { ${clientFields} } pageInfo { hasNextPage endCursor } } }`,
@@ -81,8 +81,25 @@ function normalizedPhone(value: unknown): string {
 function assertRelationship(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
+function visitWithSchedule(record: Node): Node {
+  const mode = !record.startAt && !record.endAt ? "unscheduled" : record.allDay ? "anytime" : "timed";
+  return {
+    ...record,
+    schedule: {
+      mode,
+      ...(mode !== "unscheduled" ? { start_at: record.startAt, end_at: record.endAt } : {}),
+    },
+  };
+}
+function recordWithSchedules(recordType: string, record: Node): Node {
+  if (recordType === "visit") return visitWithSchedule(record);
+  if (recordType === "job" && Array.isArray(record.visits?.nodes)) {
+    return { ...record, visits: { ...record.visits, nodes: record.visits.nodes.map(visitWithSchedule) } };
+  }
+  return record;
+}
 function response(action: string, recordType: string, record: Node) {
-  return { content: [{ type: "text" as const, text: JSON.stringify({ action, record_type: recordType, record_version: recordVersion(recordType, record), record }) }] };
+  return { content: [{ type: "text" as const, text: JSON.stringify({ action, record_type: recordType, record_version: recordVersion(recordType, record), record: recordWithSchedules(recordType, record) }) }] };
 }
 function recordVersion(recordType: string, record: Node): string {
   if (typeof record.updatedAt === "string" && record.updatedAt) return record.updatedAt;
@@ -95,6 +112,7 @@ function recordVersion(recordType: string, record: Node): string {
           visitStatus: record.visitStatus,
           isComplete: record.isComplete,
           completedAt: record.completedAt ?? null,
+          allDay: record.allDay ?? null,
           startAt: record.startAt ?? null,
           endAt: record.endAt ?? null,
           instructions: record.instructions ?? null,
@@ -180,7 +198,7 @@ export function registerFoundationalTools(server: McpServer): void {
     }
     const data = await run<Node>(SEARCHES[record_type as z.infer<typeof recordTypeSchema>], { term: search_term, first: page_size, after: cursor });
     const connection = data[record_type === "client" ? "clients" : `${record_type}s`];
-    const nodes = connection.nodes;
+    const nodes = record_type === "visit" ? connection.nodes.map(visitWithSchedule) : connection.nodes;
     const progress = pageProgress(connection.totalCount, connection.nodes.length, returned_so_far);
     await appendAuditLog({ tool: "search_records", args: { record_type, search_term, page_size, cursor }, outcome: "success", result_count: nodes.length });
     return { content: [{ type: "text", text: JSON.stringify({ record_type, total_count: connection.totalCount, returned_so_far: progress.returned_so_far, records: nodes, ...(connection.pageInfo.hasNextPage ? { next_cursor: connection.pageInfo.endCursor, remaining: progress.remaining } : {}) }) }] };
@@ -328,31 +346,283 @@ function registerQuoteJobInvoiceWrites(server: McpServer): void {
   });
 }
 
-function registerSchedulingWrites(server: McpServer): void {
-  const localTime = z.object({ date: z.string().date(), time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/).optional(), timezone: z.string().min(1).default("America/Toronto") });
-  registerWriteTool(server, "create_visit", { description: "Create a scheduled or unscheduled Jobber visit for a known job.", capability: "scheduling", inputSchema: { job_id: z.string().min(1), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), start_at: localTime.optional(), end_at: localTime.optional(), assigned_user_ids: z.array(z.string().min(1)).max(20).default([]), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
-    if ((args.start_at === undefined) !== (args.end_at === undefined)) throw new Error("start_at and end_at must be supplied together");
-    if (args.start_at && `${args.start_at.date}T${args.start_at.time ?? "00:00"}` >= `${args.end_at.date}T${args.end_at.time ?? "00:00"}`) throw new Error("Visit end time must be after its start time.");
-    const source = await run<Node>(`query VisitPreflight($id:EncodedId!){job(id:$id){id jobStatus visits(first:50){nodes{id title startAt endAt isComplete}}}}`, { id: args.job_id });
-    assertRelationship(source.job, "Job not found; no visit was created.");
-    assertRelationship(!["closed", "archived"].includes(normalized(source.job.jobStatus)), "The job is closed; no visit was created.");
-    const duplicate = source.job.visits.nodes.some((visit: Node) => args.start_at
-      ? String(visit.startAt ?? "").startsWith(`${args.start_at.date}T${args.start_at.time ?? "00:00"}`) && String(visit.endAt ?? "").startsWith(`${args.end_at.date}T${args.end_at.time ?? "00:00"}`)
-      : args.title && !visit.startAt && normalized(visit.title) === normalized(args.title));
-    if (duplicate) throw new Error("A matching visit already exists on this job; no visit was created.");
-    const schedule = args.start_at ? { startAt: args.start_at, endAt: args.end_at, teamMemberIdsToAssign: args.assigned_user_ids, notifyTeam: false } : undefined;
-    const data = await run<Node>(`mutation CreateVisit($jobId:EncodedId!,$input:VisitCreateInput!){visitCreate(jobId:$jobId,input:$input){createdVisits{${visitFields}} userErrors{message path}}}`, { jobId: args.job_id, input: { visits: [{ title: args.title, instructions: args.instructions, schedule }] } }); const visits = mutationRecord("creating visit", data, "visitCreate", "createdVisits"); const visit = singleCreatedRecord("creating visit", visits); await audit("create_visit", args, visit); return response("created", "visit", visit);
+type NormalizedVisitSchedule =
+  | { mode: "unscheduled" }
+  | { mode: "anytime"; startAt: { date: string; timezone: string }; endAt: { date: string; timezone: string } }
+  | { mode: "timed"; startAt: { date: string; time: string; timezone: string }; endAt: { date: string; time: string; timezone: string }; startInstant: number; endInstant: number };
+
+const timezoneFormatters = new Map<string, Intl.DateTimeFormat>();
+function timezoneFormatter(timezone: string): Intl.DateTimeFormat {
+  let formatter = timezoneFormatters.get(timezone);
+  if (!formatter) {
+    try {
+      formatter = new Intl.DateTimeFormat("en-CA", {
+        timeZone: timezone,
+        calendar: "gregory",
+        numberingSystem: "latn",
+        hourCycle: "h23",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+    } catch {
+      throw new Error(`Unknown timezone "${timezone}". Use an IANA timezone such as America/Toronto.`);
+    }
+    timezoneFormatters.set(timezone, formatter);
+  }
+  return formatter;
+}
+
+function localInstant(date: string, time: string, timezone: string, label: string): number {
+  const [year, month, day] = date.split("-").map(Number);
+  const parts = time.split(":").map(Number);
+  const [hour, minute, second = 0] = parts;
+  if (hour > 23 || minute > 59 || second > 59) throw new Error(`${label} has an invalid clock time.`);
+  const formatter = timezoneFormatter(timezone);
+  const localUtc = Date.UTC(year, month - 1, day, hour, minute, second);
+  const matches: number[] = [];
+  for (let offsetMinutes = -14 * 60; offsetMinutes <= 14 * 60; offsetMinutes += 15) {
+    const candidate = localUtc - offsetMinutes * 60_000;
+    const shown = Object.fromEntries(formatter.formatToParts(candidate).map((part) => [part.type, part.value]));
+    if (Number(shown.year) === year && Number(shown.month) === month && Number(shown.day) === day
+      && Number(shown.hour) === hour && Number(shown.minute) === minute && Number(shown.second) === second) matches.push(candidate);
+  }
+  const unique = [...new Set(matches)];
+  if (!unique.length) throw new Error(`${label} does not exist in ${timezone} because of a daylight-saving time change.`);
+  if (unique.length > 1) throw new Error(`${label} is ambiguous in ${timezone} because of a daylight-saving time change; choose a different time.`);
+  return unique[0];
+}
+
+function normalizeVisitSchedule(args: any): NormalizedVisitSchedule {
+  if (args.schedule !== undefined && (args.start_at !== undefined || args.end_at !== undefined)) {
+    throw new Error("Use schedule or the legacy start_at/end_at fields, not both.");
+  }
+  if (args.schedule?.mode === "unscheduled" || (args.schedule === undefined && args.start_at === undefined && args.end_at === undefined)) {
+    return { mode: "unscheduled" };
+  }
+  if (args.schedule?.mode === "anytime") {
+    const startDate = args.schedule.start_date;
+    const endDate = args.schedule.end_date ?? startDate;
+    const tz = args.schedule.timezone ?? "America/Toronto";
+    timezoneFormatter(tz);
+    if (endDate < startDate) throw new Error("Anytime visit end_date must be on or after start_date.");
+    return { mode: "anytime", startAt: { date: startDate, timezone: tz }, endAt: { date: endDate, timezone: tz } };
+  }
+  if (args.schedule?.mode === "timed") {
+    const value = { ...args.schedule, timezone: args.schedule.timezone ?? "America/Toronto" };
+    const startInstant = localInstant(value.start_date, value.start_time, value.timezone, "Visit start time");
+    const endInstant = localInstant(value.end_date, value.end_time, value.timezone, "Visit end time");
+    if (endInstant <= startInstant) throw new Error("Timed visit end must be after its start.");
+    return { mode: "timed", startAt: { date: value.start_date, time: value.start_time, timezone: value.timezone }, endAt: { date: value.end_date, time: value.end_time, timezone: value.timezone }, startInstant, endInstant };
+  }
+  if ((args.start_at === undefined) !== (args.end_at === undefined)) throw new Error("Legacy start_at and end_at must be supplied together.");
+  if (args.start_at.time === undefined && args.end_at.time === undefined) {
+    const startTimezone = args.start_at.timezone ?? "America/Toronto";
+    const endTimezone = args.end_at.timezone ?? "America/Toronto";
+    if (startTimezone !== endTimezone) throw new Error("Legacy Anytime start and end must use the same timezone.");
+    timezoneFormatter(startTimezone);
+    if (args.end_at.date < args.start_at.date) throw new Error("Anytime visit end date must be on or after its start date.");
+    return { mode: "anytime", startAt: { date: args.start_at.date, timezone: startTimezone }, endAt: { date: args.end_at.date, timezone: endTimezone } };
+  }
+  if (args.start_at.time === undefined || args.end_at.time === undefined) throw new Error("Legacy timed visits require a time on both start_at and end_at.");
+  const startTimezone = args.start_at.timezone ?? "America/Toronto";
+  const endTimezone = args.end_at.timezone ?? "America/Toronto";
+  if (startTimezone !== endTimezone) throw new Error("Legacy timed start and end must use the same timezone.");
+  const startInstant = localInstant(args.start_at.date, args.start_at.time, startTimezone, "Visit start time");
+  const endInstant = localInstant(args.end_at.date, args.end_at.time, endTimezone, "Visit end time");
+  if (endInstant <= startInstant) throw new Error("Timed visit end must be after its start.");
+  return { mode: "timed", startAt: { ...args.start_at, timezone: startTimezone }, endAt: { ...args.end_at, timezone: endTimezone }, startInstant, endInstant };
+}
+
+function jobberSchedule(schedule: NormalizedVisitSchedule, assignedUserIds: string[]): Node | undefined {
+  const assignment = { teamMemberIdsToAssign: assignedUserIds, notifyTeam: false };
+  if (schedule.mode === "unscheduled") return assignedUserIds.length ? assignment : undefined;
+  return { startAt: schedule.startAt, endAt: schedule.endAt, ...assignment };
+}
+
+function visitMatchesSchedule(visit: Node, schedule: NormalizedVisitSchedule, title?: string): boolean {
+  if (schedule.mode === "unscheduled") {
+    return !visit.startAt && !visit.endAt && (!title || normalized(visit.title) === normalized(title));
+  }
+  if (!visit.startAt || !visit.endAt) return false;
+  if (schedule.mode === "anytime") {
+    return visit.allDay === true && String(visit.startAt).slice(0, 10) === schedule.startAt.date && String(visit.endAt).slice(0, 10) === schedule.endAt.date;
+  }
+  return visit.allDay !== true && Date.parse(visit.startAt) === schedule.startInstant && Date.parse(visit.endAt) === schedule.endInstant;
+}
+
+function visitSpecKey(item: any): string {
+  const schedule = item.normalizedSchedule as NormalizedVisitSchedule;
+  if (schedule.mode === "unscheduled") return `unscheduled:${normalized(item.title)}`;
+  if (schedule.mode === "anytime") return `anytime:${schedule.startAt.date}:${schedule.endAt.date}:${schedule.startAt.timezone}`;
+  return `timed:${schedule.startInstant}:${schedule.endInstant}`;
+}
+
+function rejectRepeatedVisitSpecs(items: any[]): void {
+  const seen = new Set<string>();
+  for (const item of items) {
+    const key = visitSpecKey(item);
+    if (seen.has(key)) throw new Error("The request contains repeated visit schedules; no visits were created.");
+    seen.add(key);
+  }
+}
+
+async function loadVisitPreflight(jobId: string, run: any): Promise<{ job: Node | null; visits: Node[] }> {
+  let cursor: string | undefined;
+  let job: Node | null = null;
+  const visits: Node[] = [];
+  for (let page = 0; page < 200; page++) {
+    const data = await run(`query VisitPreflight($id:EncodedId!,$after:String){job(id:$id){id jobStatus visits(first:50,after:$after){nodes{${visitFields}} pageInfo{hasNextPage endCursor}}}}`, { id: jobId, after: cursor });
+    if (!data.job) return { job: null, visits: [] };
+    job = data.job;
+    visits.push(...data.job.visits.nodes);
+    if (!data.job.visits.pageInfo.hasNextPage) return { job, visits };
+    cursor = data.job.visits.pageInfo.endCursor;
+    if (!cursor) throw new Error("Jobber did not provide a cursor while listing existing visits; no write was attempted.");
+  }
+  throw new Error("The job has too many visits to safely complete duplicate checking; no write was attempted.");
+}
+
+async function assertSchedulableUsers(requestedIds: string[], run: any): Promise<void> {
+  let cursor: string | undefined;
+  let complete = false;
+  const users = new Map<string, Node>();
+  for (let page = 0; page < 200; page++) {
+    const data = await run(`query SchedulableUsers($after:String){users(first:50,after:$after){nodes{id availableForScheduling status} pageInfo{hasNextPage endCursor}}}`, { after: cursor });
+    for (const user of data.users.nodes) users.set(user.id, user);
+    if (!data.users.pageInfo.hasNextPage) {
+      complete = true;
+      break;
+    }
+    cursor = data.users.pageInfo.endCursor;
+    if (!cursor) throw new Error("Jobber did not provide a cursor while validating team members; no write was attempted.");
+  }
+  if (!complete) throw new Error("The account has too many team members to safely validate assignments; no write was attempted.");
+  const invalid = requestedIds.filter((id) => !users.has(id) || users.get(id)?.availableForScheduling === false || normalized(users.get(id)?.status) === "inactive");
+  if (invalid.length) throw new Error(`These team member IDs are missing or unavailable for scheduling: ${invalid.join(", ")}. No write was attempted.`);
+}
+
+function sameIds(actual: string[], expected: string[]): boolean {
+  return JSON.stringify([...new Set(actual)].sort()) === JSON.stringify([...new Set(expected)].sort());
+}
+
+function errorInputIndex(error: Node): number | undefined {
+  for (const part of error.path ?? []) if (/^\d+$/.test(String(part))) return Number(part);
+}
+
+function matchVisitResults(prepared: any[], created: Node[], errors: Node[]): any[] {
+  const remaining = [...created];
+  return prepared.map((item, inputIndex) => {
+    const createdIndex = remaining.findIndex((visit) => visitMatchesSchedule(visit, item.normalizedSchedule, item.title));
+    if (createdIndex >= 0) {
+      const [record] = remaining.splice(createdIndex, 1);
+      return { input_index: inputIndex, status: "created", verification: "pending", record: visitWithSchedule(record) };
+    }
+    const itemErrors = errors.filter((error) => errorInputIndex(error) === inputIndex);
+    return itemErrors.length
+      ? { input_index: inputIndex, status: "rejected", errors: itemErrors }
+      : { input_index: inputIndex, status: "uncertain", errors };
   });
-  registerWriteTool(server, "update_visit", { description: "Update one aspect of a reviewed Jobber visit: details, schedule, or assignments. One mutation is executed per call.", capability: "scheduling", inputSchema: { visit_id: z.string().min(1), expected_record_version: z.string().min(1), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), start_at: localTime.optional(), end_at: localTime.optional(), assigned_user_ids: z.array(z.string().min(1)).max(20).optional(), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
-    if ((args.start_at === undefined) !== (args.end_at === undefined)) throw new Error("start_at and end_at must be supplied together");
-    if (args.start_at && `${args.start_at.date}T${args.start_at.time ?? "00:00"}` >= `${args.end_at.date}T${args.end_at.time ?? "00:00"}`) throw new Error("Visit end time must be after its start time.");
+}
+
+function toolResult(payload: Node, isError = false) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(payload) }], ...(isError ? { isError: true } : {}) };
+}
+
+async function auditVisitBatch(tool: string, jobId: string, specs: any[], created: Node[]): Promise<void> {
+  await appendAuditLog({
+    tool,
+    args: { action: tool, record_type: "visit", source_record_ids: { job_id: jobId }, requested_count: specs.length, created_record_ids: created.map((visit) => visit.id) },
+    outcome: "success",
+    result_count: created.length,
+  });
+}
+
+function registerSchedulingWrites(server: McpServer): void {
+  const timezone = z.string().trim().min(1).default("America/Toronto");
+  const localTime = z.object({ date: z.string().date(), time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/).optional(), timezone });
+  const schedule = z.discriminatedUnion("mode", [
+    z.object({ mode: z.literal("anytime"), start_date: z.string().date(), end_date: z.string().date().optional(), timezone }),
+    z.object({ mode: z.literal("timed"), start_date: z.string().date(), start_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/), end_date: z.string().date(), end_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/), timezone }),
+    z.object({ mode: z.literal("unscheduled") }),
+  ]).describe("Use anytime for a date without a time, timed for exact times, or unscheduled for no date.");
+  const visitSpec = z.object({
+    title: z.string().trim().max(250).optional(),
+    instructions: z.string().trim().max(10000).optional(),
+    schedule: schedule.optional(),
+    start_at: localTime.optional().describe("Legacy schedule input; prefer schedule."),
+    end_at: localTime.optional().describe("Legacy schedule input; prefer schedule."),
+    assigned_user_ids: z.array(z.string().min(1)).max(20).default([]),
+  });
+
+  const createOne = async (tool: string, jobId: string, specs: any[], run: any) => {
+    const prepared = specs.map((spec) => ({ ...spec, normalizedSchedule: normalizeVisitSchedule(spec) }));
+    for (const item of prepared) {
+      if (new Set(item.assigned_user_ids).size !== item.assigned_user_ids.length) throw new Error("A visit contains a repeated assigned_user_id; no visits were created.");
+    }
+    rejectRepeatedVisitSpecs(prepared);
+    const before = await loadVisitPreflight(jobId, run);
+    assertRelationship(before.job, "Job not found; no visit was created.");
+    assertRelationship(!["closed", "archived"].includes(normalized(before.job.jobStatus)), "The job is closed; no visit was created.");
+    const requestedUsers = [...new Set(prepared.flatMap((item) => item.assigned_user_ids))];
+    if (requestedUsers.length) await assertSchedulableUsers(requestedUsers, run);
+    for (const item of prepared) {
+      if (before.visits.some((visit: Node) => visitMatchesSchedule(visit, item.normalizedSchedule, item.title))) {
+        throw new Error(`A matching ${item.normalizedSchedule.mode} visit already exists on this job; no visits were created.`);
+      }
+    }
+
+    let data: Node;
+    try {
+      data = await run(`mutation CreateVisits($jobId:EncodedId!,$input:VisitCreateInput!){visitCreate(jobId:$jobId,input:$input){createdVisits{${visitFields}} userErrors{message path}}}`, {
+        jobId,
+        input: { visits: prepared.map((item) => ({ title: item.title, instructions: item.instructions, schedule: jobberSchedule(item.normalizedSchedule, item.assigned_user_ids) })) },
+      });
+    } catch (error: any) {
+      return toolResult({ action: "create", record_type: "visit", outcome: "uncertain", error: error.message, guidance: "The write was not retried. Re-read the job and check Jobber before requesting another write." }, true);
+    }
+
+    const payload = data.visitCreate;
+    if (!payload || !Array.isArray(payload.createdVisits) || !Array.isArray(payload.userErrors)) {
+      return toolResult({ action: "create", record_type: "visit", outcome: "uncertain", error: "Jobber returned an incomplete visit creation result.", guidance: "Re-read the job and check Jobber before requesting another write." }, true);
+    }
+    const created = payload.createdVisits as Node[];
+    const results = matchVisitResults(prepared, created, payload.userErrors);
+    try {
+      const after = await loadVisitPreflight(jobId, run);
+      const byId = new Map(after.visits.map((visit: Node) => [visit.id, visit]));
+      for (const result of results) {
+        if (result.status !== "created" || !result.record?.id) continue;
+        const readback = byId.get(result.record.id);
+        result.verification = readback && visitMatchesSchedule(readback, prepared[result.input_index].normalizedSchedule, prepared[result.input_index].title)
+          && sameIds(readback.assignedUsers?.nodes?.map((user: Node) => user.id) ?? [], prepared[result.input_index].assigned_user_ids)
+          ? "verified"
+          : "mismatch";
+        if (readback) result.record = visitWithSchedule(readback);
+      }
+    } catch {
+      for (const result of results) if (result.status === "created") result.verification = "uncertain";
+    }
+    const complete = results.every((result) => result.status === "created" && result.verification === "verified");
+    await auditVisitBatch(tool, jobId, specs, created);
+    return toolResult({ action: "create", record_type: "visit", outcome: complete ? "created" : "partial", job_id: jobId, results, user_errors: payload.userErrors });
+  };
+
+  registerWriteTool(server, "create_visit", { description: "Create one Jobber visit. Use schedule.mode=anytime for a date with no time, timed for exact times, or unscheduled for no date.", capability: "scheduling", inputSchema: { job_id: z.string().min(1), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), schedule: schedule.optional(), start_at: localTime.optional(), end_at: localTime.optional(), assigned_user_ids: z.array(z.string().min(1)).max(20).default([]), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => createOne("create_visit", args.job_id, [args], run));
+  registerWriteTool(server, "create_visits", { description: "Create 1-20 reviewed Jobber visits for one job in one mutation. Prefer this for multiple dates; each visit may be anytime, timed, or unscheduled.", capability: "scheduling", inputSchema: { job_id: z.string().min(1), visits: z.array(visitSpec).min(1).max(20), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => createOne("create_visits", args.job_id, args.visits, run));
+  registerWriteTool(server, "update_visit", { description: "Update one aspect of a reviewed Jobber visit: details, schedule, or assignments. schedule.mode supports anytime, timed, and unscheduled.", capability: "scheduling", inputSchema: { visit_id: z.string().min(1), expected_record_version: z.string().min(1), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), schedule: schedule.optional(), start_at: localTime.optional(), end_at: localTime.optional(), assigned_user_ids: z.array(z.string().min(1)).max(20).optional(), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
+    const hasSchedule = args.schedule !== undefined || args.start_at !== undefined || args.end_at !== undefined;
+    const normalizedSchedule = hasSchedule ? normalizeVisitSchedule(args) : undefined;
     const current = await run<Node>(`query VisitVersion($id:EncodedId!){visit(id:$id){${visitFields}}}`, { id: args.visit_id }); if (!current.visit || recordVersion("visit", current.visit) !== args.expected_record_version) throw new Error("Visit changed since it was reviewed; fetch it again before updating.");
-    const changes = [args.title !== undefined || args.instructions !== undefined, args.start_at !== undefined, args.assigned_user_ids !== undefined].filter(Boolean).length;
+    const changes = [args.title !== undefined || args.instructions !== undefined, hasSchedule, args.assigned_user_ids !== undefined].filter(Boolean).length;
     if (changes !== 1) throw new Error("Update exactly one visit aspect per call: details, schedule, or assignments.");
     let visit: Node;
     if (args.title !== undefined || args.instructions !== undefined) { const data = await run<Node>(`mutation EditVisit($id:EncodedId!,$attributes:VisitEditAttributes!){visitEdit(id:$id,attributes:$attributes){visit{${visitFields}} userErrors{message path}}}`, { id: args.visit_id, attributes: { title: args.title, instructions: args.instructions } }); visit = mutationRecord("updating visit", data, "visitEdit", "visit"); }
-    else if (args.start_at) { const data = await run<Node>(`mutation ScheduleVisit($id:EncodedId!,$input:VisitEditScheduleInput!){visitEditSchedule(id:$id,input:$input){visit{${visitFields}} userErrors{message path}}}`, { id: args.visit_id, input: { startAt: args.start_at, endAt: args.end_at } }); visit = mutationRecord("scheduling visit", data, "visitEditSchedule", "visit"); }
-    else { const data = await run<Node>(`mutation AssignVisit($visitId:EncodedId!,$input:VisitEditAssignedUsersInput!){visitEditAssignedUsers(visitId:$visitId,input:$input){visit{${visitFields}} userErrors{message path}}}`, { visitId: args.visit_id, input: { assignedUserIds: args.assigned_user_ids } }); visit = mutationRecord("assigning visit", data, "visitEditAssignedUsers", "visit"); }
+    else if (normalizedSchedule) { const data = await run<Node>(`mutation ScheduleVisit($id:EncodedId!,$input:VisitEditScheduleInput!){visitEditSchedule(id:$id,input:$input){visit{${visitFields}} userErrors{message path}}}`, { id: args.visit_id, input: normalizedSchedule.mode === "unscheduled" ? { startAt: null, endAt: null } : { startAt: normalizedSchedule.startAt, endAt: normalizedSchedule.endAt } }); visit = mutationRecord("scheduling visit", data, "visitEditSchedule", "visit"); }
+    else { if (new Set(args.assigned_user_ids).size !== args.assigned_user_ids.length) throw new Error("assigned_user_ids contains a repeated team member ID."); if (args.assigned_user_ids.length) await assertSchedulableUsers(args.assigned_user_ids, run); const data = await run<Node>(`mutation AssignVisit($visitId:EncodedId!,$input:VisitEditAssignedUsersInput!){visitEditAssignedUsers(visitId:$visitId,input:$input){visit{${visitFields}} userErrors{message path}}}`, { visitId: args.visit_id, input: { assignedUserIds: args.assigned_user_ids } }); visit = mutationRecord("assigning visit", data, "visitEditAssignedUsers", "visit"); }
     await audit("update_visit", args, visit); return response("updated", "visit", visit);
   });
   registerWriteTool(server, "complete_visit", { description: "Mark a reviewed Jobber visit complete. This is an operationally consequential action.", capability: "scheduling", inputSchema: { visit_id: z.string().min(1), expected_record_version: z.string().min(1), completed_at: z.string().datetime().optional(), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
