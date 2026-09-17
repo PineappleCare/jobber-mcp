@@ -432,7 +432,9 @@ describe("foundational operations", () => {
     process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
     const page = { job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } };
     mockRead.mockResolvedValueOnce(page);
-    mockWrite.mockRejectedValueOnce(new Error("Jobber server error; outcome is unknown"));
+    const uncertain = new Error("Jobber server error; outcome is unknown");
+    uncertain.name = "JobberOutcomeUncertainError";
+    mockWrite.mockRejectedValueOnce(uncertain);
     const server = fakeServer();
     registerFoundationalTools(server as any);
 
@@ -442,6 +444,27 @@ describe("foundational operations", () => {
     expect(JSON.parse(result.content[0].text).outcome).toBe("uncertain");
     expect(mockRead).toHaveBeenCalledTimes(1);
     expect(mockWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it("classifies a definite mutation authentication failure as connection unavailable", async () => {
+    process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
+    const page = { job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } };
+    mockRead.mockResolvedValueOnce(page);
+    const auth = new Error("access token rejected");
+    auth.name = "JobberApiError";
+    mockWrite.mockRejectedValueOnce(auth);
+    const server = fakeServer();
+    registerFoundationalTools(server as any);
+
+    const result = await server.handlers.create_visit({
+      job_id: "job-1",
+      schedule: { mode: "anytime", start_date: "2026-09-18", timezone: "America/Toronto" },
+      assigned_user_ids: [],
+      confirm_write: true,
+    });
+
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ outcome: "error", error_type: "connection_unavailable" });
   });
 
   it("finds a duplicate visit beyond the first preflight page", async () => {

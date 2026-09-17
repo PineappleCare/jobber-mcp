@@ -615,6 +615,7 @@ function registerSchedulingWrites(server: McpServer): void {
         input: { visits: prepared.map((item) => ({ title: item.title, instructions: item.instructions, schedule: jobberSchedule(item.normalizedSchedule, item.assigned_user_ids) })) },
       });
     } catch (error: any) {
+      if (error?.name !== "JobberOutcomeUncertainError") throw error;
       await auditVisitBatch(tool, jobId, specs, [], "error", "mutation outcome uncertain; reconciliation required");
       return toolResult({ action: "create", record_type: "visit", outcome: "uncertain", error: error.message, guidance: "The write was not retried. Re-read the job and check Jobber before requesting another write." }, true);
     }
