@@ -291,6 +291,25 @@ describe("foundational operations", () => {
     expect(mockWrite).not.toHaveBeenCalled();
   });
 
+  it("does not silently turn an omitted single-visit schedule into unscheduled", async () => {
+    process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
+    const server = fakeServer();
+    registerFoundationalTools(server as any);
+
+    const result = await server.handlers.create_visit({
+      job_id: "job-1",
+      title: "Missing schedule",
+      assigned_user_ids: [],
+      confirm_write: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("explicit schedule mode");
+    expect(mockRead).not.toHaveBeenCalled();
+    expect(mockWrite).not.toHaveBeenCalled();
+  });
+
   it("rejects deactivated team members before mutation", async () => {
     process.env.JOBBER_READ_ONLY = "false";
     process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";

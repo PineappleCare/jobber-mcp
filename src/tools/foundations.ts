@@ -592,6 +592,11 @@ function registerSchedulingWrites(server: McpServer): void {
   });
 
   const createOne = async (tool: string, jobId: string, specs: any[], run: any) => {
+    for (const spec of specs) {
+      if (spec.schedule === undefined && spec.start_at === undefined && spec.end_at === undefined) {
+        throw new Error("Choose an explicit schedule mode, including mode=unscheduled when no date is wanted.");
+      }
+    }
     const prepared = specs.map((spec) => ({ ...spec, normalizedSchedule: normalizeVisitSchedule(spec) }));
     for (const item of prepared) {
       if (new Set(item.assigned_user_ids).size !== item.assigned_user_ids.length) throw new Error("A visit contains a repeated assigned_user_id; no visits were created.");
