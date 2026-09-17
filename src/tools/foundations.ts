@@ -566,6 +566,32 @@ async function auditVisitBatch(
   });
 }
 
+function visitUpdateMatches(record: Node, args: any, schedule?: NormalizedVisitSchedule): boolean {
+  if (args.title !== undefined && record.title !== args.title) return false;
+  if (args.instructions !== undefined && record.instructions !== args.instructions) return false;
+  if (schedule !== undefined && !visitMatchesSchedule(record, schedule)) return false;
+  if (args.assigned_user_ids !== undefined) {
+    const actual = record.assignedUsers?.nodes?.map((user: Node) => user.id) ?? [];
+    if (!sameIds(actual, args.assigned_user_ids)) return false;
+  }
+  return true;
+}
+
+async function auditVisitUpdateConcern(args: any, record: Node | undefined, message: string): Promise<void> {
+  await appendAuditLog({
+    tool: "update_visit",
+    args: {
+      action: "update_visit",
+      record_type: "visit",
+      ...(record?.id ? { record_id: record.id } : {}),
+      source_record_ids: { visit_id: args.visit_id },
+    },
+    outcome: "partial",
+    error_message: message,
+    result_count: record?.id ? 1 : 0,
+  });
+}
+
 function registerSchedulingWrites(server: McpServer): void {
   const timezone = z.string().trim().min(1).default("America/Toronto");
   const localTime = z.object({ date: z.string().date(), time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/).optional(), timezone });
@@ -678,14 +704,43 @@ function registerSchedulingWrites(server: McpServer): void {
   registerWriteTool(server, "update_visit", { description: "Update one aspect of a reviewed Jobber visit: details, schedule, or assignments. schedule.mode supports anytime, timed, and unscheduled.", capability: "scheduling", inputSchema: { visit_id: z.string().min(1), expected_record_version: z.string().min(1), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), schedule: schedule.optional(), start_at: localTime.optional(), end_at: localTime.optional(), assigned_user_ids: z.array(z.string().min(1)).max(20).optional(), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
     const hasSchedule = args.schedule !== undefined || args.start_at !== undefined || args.end_at !== undefined;
     const normalizedSchedule = hasSchedule ? normalizeVisitSchedule(args) : undefined;
-    const current = await run<Node>(`query VisitVersion($id:EncodedId!){visit(id:$id){${visitFields}}}`, { id: args.visit_id }); if (!current.visit || recordVersion("visit", current.visit) !== args.expected_record_version) throw new Error("Visit changed since it was reviewed; fetch it again before updating.");
     const changes = [args.title !== undefined || args.instructions !== undefined, hasSchedule, args.assigned_user_ids !== undefined].filter(Boolean).length;
     if (changes !== 1) throw new Error("Update exactly one visit aspect per call: details, schedule, or assignments.");
-    let visit: Node;
-    if (args.title !== undefined || args.instructions !== undefined) { const data = await run<Node>(`mutation EditVisit($id:EncodedId!,$attributes:VisitEditAttributes!){visitEdit(id:$id,attributes:$attributes){visit{${visitFields}} userErrors{message path}}}`, { id: args.visit_id, attributes: { title: args.title, instructions: args.instructions } }); visit = mutationRecord("updating visit", data, "visitEdit", "visit"); }
-    else if (normalizedSchedule) { const data = await run<Node>(`mutation ScheduleVisit($id:EncodedId!,$input:VisitEditScheduleInput!){visitEditSchedule(id:$id,input:$input){visit{${visitFields}} userErrors{message path}}}`, { id: args.visit_id, input: normalizedSchedule.mode === "unscheduled" ? { startAt: null, endAt: null } : { startAt: normalizedSchedule.startAt, endAt: normalizedSchedule.endAt } }); visit = mutationRecord("scheduling visit", data, "visitEditSchedule", "visit"); }
-    else { if (new Set(args.assigned_user_ids).size !== args.assigned_user_ids.length) throw new Error("assigned_user_ids contains a repeated team member ID."); if (args.assigned_user_ids.length) await assertSchedulableUsers(args.assigned_user_ids, run); const data = await run<Node>(`mutation AssignVisit($visitId:EncodedId!,$input:VisitEditAssignedUsersInput!){visitEditAssignedUsers(visitId:$visitId,input:$input){visit{${visitFields}} userErrors{message path}}}`, { visitId: args.visit_id, input: { assignedUserIds: args.assigned_user_ids } }); visit = mutationRecord("assigning visit", data, "visitEditAssignedUsers", "visit"); }
-    await audit("update_visit", args, visit); return response("updated", "visit", visit);
+
+    const current = await run<Node>(`query VisitVersion($id:EncodedId!){visit(id:$id){${visitFields}}}`, { id: args.visit_id });
+    if (!current.visit || recordVersion("visit", current.visit) !== args.expected_record_version) throw new Error("Visit changed since it was reviewed; fetch it again before updating.");
+
+    let mutationVisit: Node;
+    if (args.title !== undefined || args.instructions !== undefined) {
+      const data = await run<Node>(`mutation EditVisit($id:EncodedId!,$attributes:VisitEditAttributes!){visitEdit(id:$id,attributes:$attributes){visit{${visitFields}} userErrors{message path}}}`, { id: args.visit_id, attributes: { title: args.title, instructions: args.instructions } });
+      mutationVisit = mutationRecord("updating visit", data, "visitEdit", "visit");
+    } else if (normalizedSchedule) {
+      const data = await run<Node>(`mutation ScheduleVisit($id:EncodedId!,$input:VisitEditScheduleInput!){visitEditSchedule(id:$id,input:$input){visit{${visitFields}} userErrors{message path}}}`, { id: args.visit_id, input: normalizedSchedule.mode === "unscheduled" ? { startAt: null, endAt: null } : { startAt: normalizedSchedule.startAt, endAt: normalizedSchedule.endAt } });
+      mutationVisit = mutationRecord("scheduling visit", data, "visitEditSchedule", "visit");
+    } else {
+      if (new Set(args.assigned_user_ids).size !== args.assigned_user_ids.length) throw new Error("assigned_user_ids contains a repeated team member ID.");
+      if (args.assigned_user_ids.length) await assertSchedulableUsers(args.assigned_user_ids, run);
+      const data = await run<Node>(`mutation AssignVisit($visitId:EncodedId!,$input:VisitEditAssignedUsersInput!){visitEditAssignedUsers(visitId:$visitId,input:$input){visit{${visitFields}} userErrors{message path}}}`, { visitId: args.visit_id, input: { assignedUserIds: args.assigned_user_ids } });
+      mutationVisit = mutationRecord("assigning visit", data, "visitEditAssignedUsers", "visit");
+    }
+
+    let readback: Node;
+    try {
+      const verification = await run<Node>(`query VerifyVisitUpdate($id:EncodedId!){visit(id:$id){${visitFields}}}`, { id: args.visit_id });
+      readback = verification.visit;
+    } catch (error: any) {
+      const message = error instanceof Error ? error.message : String(error);
+      await auditVisitUpdateConcern(args, mutationVisit, "verification read failed after mutation");
+      return toolResult({ action: "update", record_type: "visit", outcome: "uncertain", record: visitWithSchedule(mutationVisit), verification_error: message, guidance: "The write was not retried. Re-read the visit in Jobber before requesting another update." }, true);
+    }
+
+    if (!readback || !visitUpdateMatches(readback, args, normalizedSchedule)) {
+      await auditVisitUpdateConcern(args, readback ?? mutationVisit, "updated visit did not match the approved request during readback");
+      return toolResult({ action: "update", record_type: "visit", outcome: "mismatch", record: visitWithSchedule(readback ?? mutationVisit), guidance: "Review the visit in Jobber. Do not retry this update until the current record has been read again." }, true);
+    }
+
+    await audit("update_visit", args, readback);
+    return response("updated", "visit", readback);
   });
   registerWriteTool(server, "complete_visit", { description: "Mark a reviewed Jobber visit complete. This is an operationally consequential action.", capability: "scheduling", inputSchema: { visit_id: z.string().min(1), expected_record_version: z.string().min(1), completed_at: z.string().datetime().optional(), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
     const current = await run<Node>(`query VisitVersion($id:EncodedId!){visit(id:$id){${visitFields}}}`, { id: args.visit_id }); if (!current.visit || recordVersion("visit", current.visit) !== args.expected_record_version) throw new Error("Visit changed since it was reviewed; fetch it again before completing."); if (current.visit.isComplete) throw new Error("Visit is already complete."); const data = await run<Node>(`mutation CompleteVisit($visitId:EncodedId!,$input:VisitCompleteInput!){visitComplete(visitId:$visitId,input:$input){visit{${visitFields}} userErrors{message path}}}`, { visitId: args.visit_id, input: { completedAt: args.completed_at } }); const visit = mutationRecord("completing visit", data, "visitComplete", "visit"); await audit("complete_visit", args, visit); return response("completed", "visit", visit);

@@ -301,7 +301,9 @@ describe("registerWriteTool", () => {
     ["JobberOutcomeUncertainError", "outcome_uncertain"],
     ["JobberRejectedError", "jobber_rejected"],
     ["JobberPermissionError", "jobber_rejected"],
+    ["JobberGraphQLRequestError", "jobber_rejected"],
     ["JobberApiError", "connection_unavailable"],
+    ["JobberAuthenticationError", "connection_unavailable"],
     ["BudgetUnavailableError", "connection_unavailable"],
     ["Error", "invalid_request"],
   ])("classifies %s without relying on message text", async (name, expectedType) => {

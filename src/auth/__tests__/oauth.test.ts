@@ -26,6 +26,7 @@ import {
   revokeToken,
   getValidAccessToken,
 } from "../oauth.js";
+import { JobberAuthenticationError } from "../../jobber/errors.js";
 
 const ENV_KEYS = [
   "JOBBER_CLIENT_ID",
@@ -205,10 +206,11 @@ describe("refreshTokensPure", () => {
     expect(tokens.refresh_token).toBe("keep-me");
   });
 
-  it("throws a generic re-authenticate message on failure", async () => {
+  it("throws a classified authentication error on failure", async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 400, text: async () => "" });
     vi.stubGlobal("fetch", fetchMock);
 
+    await expect(refreshTokensPure("x")).rejects.toBeInstanceOf(JobberAuthenticationError);
     await expect(refreshTokensPure("x")).rejects.toThrow("Token refresh failed, please re-authenticate.");
   });
 });

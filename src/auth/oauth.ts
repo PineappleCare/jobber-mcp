@@ -2,6 +2,7 @@ import http from "http";
 import crypto from "crypto";
 import { z } from "zod";
 import { saveTokens, loadTokens, withTokenLock } from "./tokenStorage.js";
+import { JobberAuthenticationError } from "../jobber/errors.js";
 
 function getAuthUrl() {
   return process.env.JOBBER_AUTH_URL ?? "https://api.getjobber.com/api/oauth/authorize";
@@ -33,7 +34,7 @@ const TokenResponseSchema = z.object({
 function parseTokenResponse(data: unknown): z.infer<typeof TokenResponseSchema> {
   const parsed = TokenResponseSchema.safeParse(data);
   if (!parsed.success) {
-    throw new Error(`Jobber's token response was missing or had an invalid field: ${parsed.error.message}`);
+    throw new JobberAuthenticationError(`Jobber's token response was missing or had an invalid field: ${parsed.error.message}`);
   }
   return parsed.data;
 }
@@ -169,7 +170,7 @@ async function exchangeCodeForTokens(
 
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(
+    throw new JobberAuthenticationError(
       `Token exchange failed.\n` +
       `  Token URL  : ${tokenUrl}\n` +
       `  Redirect   : ${redirectUri}\n` +
@@ -272,7 +273,7 @@ export async function refreshTokensPure(refreshToken: string): Promise<JobberTok
   });
 
   if (!res.ok) {
-    throw new Error("Token refresh failed, please re-authenticate.");
+    throw new JobberAuthenticationError("Token refresh failed, please re-authenticate.");
   }
 
   const data = parseTokenResponse(await res.json());
@@ -346,7 +347,7 @@ async function refreshAccessToken(tokens: JobberTokens): Promise<JobberTokens> {
   });
 
   if (!res.ok) {
-    throw new Error("Token refresh failed, please log in again.");
+    throw new JobberAuthenticationError("Token refresh failed, please log in again.");
   }
 
   const data = parseTokenResponse(await res.json());

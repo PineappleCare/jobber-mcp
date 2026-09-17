@@ -152,9 +152,9 @@ function toolErrorPayload(error: unknown): string {
   const err = error instanceof Error ? error : new Error(String(error));
   const errorType = err.name === "JobberOutcomeUncertainError"
     ? "outcome_uncertain"
-    : err.name === "JobberRejectedError" || err.name === "JobberPermissionError"
+    : ["JobberRejectedError", "JobberPermissionError", "JobberGraphQLRequestError"].includes(err.name)
       ? "jobber_rejected"
-      : ["JobberApiError", "BudgetUnavailableError", "RequestRateLimitError"].includes(err.name)
+      : ["JobberApiError", "JobberAuthenticationError", "BudgetUnavailableError", "RequestRateLimitError"].includes(err.name)
         ? "connection_unavailable"
         : "invalid_request";
   return JSON.stringify({ outcome: "error", error_type: errorType, error: err.message });

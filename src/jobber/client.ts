@@ -3,40 +3,26 @@ import { requireSessionContext } from "../utils/sessionContext.js";
 import type { SessionContext } from "../utils/sessionContext.js";
 import { CostGovernor } from "./cost-governor.js";
 import { ACCOUNT_ID_QUERY } from "./queries.js";
+import {
+  JobberApiError,
+  JobberAuthenticationError,
+  JobberGraphQLRequestError,
+  JobberOutcomeUncertainError,
+  JobberPermissionError,
+} from "./errors.js";
+
+export {
+  JobberApiError,
+  JobberAuthenticationError,
+  JobberGraphQLRequestError,
+  JobberOutcomeUncertainError,
+  JobberPermissionError,
+} from "./errors.js";
 
 export const JOBBER_GRAPHQL_VERSION = process.env.JOBBER_GRAPHQL_VERSION ?? "2025-04-16";
 
 function getGraphqlUrl(): string {
   return process.env.JOBBER_GRAPHQL_URL ?? "https://api.getjobber.com/api/graphql";
-}
-
-export class JobberApiError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "JobberApiError";
-  }
-}
-
-export class JobberPermissionError extends Error {
-  constructor(originalMessage?: string) {
-    super(
-      "Jobber restricts this data to accounts on its top-tier plan. " +
-      "Upgrade your Jobber plan to use this feature: https://getjobber.com/pricing/" +
-      (originalMessage ? ` (Jobber said: ${originalMessage})` : "")
-    );
-    this.name = "JobberPermissionError";
-  }
-}
-
-/**
- * A write request failed after it may have reached Jobber. Callers must
- * reconcile through reads and must never retry the mutation automatically.
- */
-export class JobberOutcomeUncertainError extends JobberApiError {
-  constructor(message: string) {
-    super(message);
-    this.name = "JobberOutcomeUncertainError";
-  }
 }
 
 const MAX_THROTTLE_RETRIES = 1;
@@ -215,6 +201,22 @@ function isPermissionError(body: any): boolean {
   });
 }
 
+function mergeMutationErrorsIntoData<T>(data: T, errors: any[]): T | undefined {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return undefined;
+  for (const [field, value] of Object.entries(data as Record<string, any>)) {
+    if (value === null || typeof value !== "object" || !Array.isArray(value.userErrors)) continue;
+    const userErrors = errors.map((error) => ({
+      message: String(error?.message ?? "Jobber returned an unspecified GraphQL error"),
+      ...(Array.isArray(error?.path) ? { path: error.path.map(String) } : {}),
+    }));
+    return {
+      ...(data as Record<string, any>),
+      [field]: { ...value, userErrors: [...value.userErrors, ...userErrors] },
+    } as T;
+  }
+  return undefined;
+}
+
 /**
  * Executes a fixed, pre-reviewed GraphQL document against Jobber's API,
  * enforcing the tool's declared max cost via the cost governor and handling
@@ -301,7 +303,7 @@ async function executeGraphQL<T = any>(
       // either bare or with an `errors` array attached, and either way the actionable guidance is
       // the same - the access token was rejected, not a generic API/GraphQL failure.
       if (status === 401) {
-        throw new JobberApiError(
+        throw new JobberAuthenticationError(
           "Jobber API error: HTTP 401 - access token was rejected; run the authenticate tool to log in again."
         );
       }
@@ -320,19 +322,33 @@ async function executeGraphQL<T = any>(
         await sleep(FIVE_XX_BACKOFF_MS[Math.min(fiveXxRetries - 1, FIVE_XX_BACKOFF_MS.length - 1)]);
         continue;
       }
+      if (!isMutation && status >= 500) {
+        if (body?.extensions?.cost) {
+          governor.recordCost(body.extensions.cost);
+          costRecorded = true;
+        }
+        const detail = Array.isArray(body?.errors)
+          ? ` - ${body.errors.map((error: any) => error.message).join("; ")}`
+          : "";
+        throw new JobberApiError(`Jobber API error: HTTP ${status}${detail}`);
+      }
 
       if (Array.isArray(body?.errors) && body.errors.length > 0) {
         if (body?.extensions?.cost) {
           governor.recordCost(body.extensions.cost);
           costRecorded = true;
         }
+        if (isMutation && status < 400 && body.data !== undefined) {
+          const merged = mergeMutationErrorsIntoData<T>(body.data, body.errors);
+          if (merged !== undefined) return merged;
+        }
         const message = body.errors.map((e: any) => e.message).join("; ");
         if (isPermissionError(body)) throw new JobberPermissionError(message);
-        throw new JobberApiError(`Jobber API error: ${message}`);
+        throw new JobberGraphQLRequestError(`Jobber API error: ${message}`);
       }
 
       if (status >= 400) {
-        throw new JobberApiError(`Jobber API error: HTTP ${status}`);
+        throw new JobberGraphQLRequestError(`Jobber API error: HTTP ${status}`);
       }
 
       if (parseFailed) {

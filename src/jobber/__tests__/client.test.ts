@@ -17,6 +17,8 @@ import {
   jobberGraphQL,
   jobberGraphQLWrite,
   JobberApiError,
+  JobberAuthenticationError,
+  JobberGraphQLRequestError,
   JobberOutcomeUncertainError,
   JobberPermissionError,
   getGovernorForSession,
@@ -265,7 +267,7 @@ describe("jobberGraphQL - account-id-based governor sharing", () => {
 });
 
 describe("jobberGraphQL - GraphQL errors", () => {
-  it("throws JobberApiError with the joined error messages for generic GraphQL errors", async () => {
+  it("throws JobberGraphQLRequestError with the joined error messages for generic GraphQL errors", async () => {
     mockRequireSessionContext.mockReturnValue(null);
     mockGetValidAccessToken.mockResolvedValue("t");
     vi.stubGlobal(
@@ -273,8 +275,34 @@ describe("jobberGraphQL - GraphQL errors", () => {
       vi.fn().mockResolvedValue(jsonResponse(200, { errors: [{ message: "Client not found" }] }))
     );
 
-    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(JobberApiError);
+    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(JobberGraphQLRequestError);
     await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow("Client not found");
+  });
+
+  it("preserves mutation data when Jobber returns created records and top-level errors", async () => {
+    mockRequireSessionContext.mockReturnValue(null);
+    mockGetValidAccessToken.mockResolvedValue("t");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        jsonResponse(200, {
+          data: {
+            visitCreate: {
+              createdVisits: [{ id: "visit-created" }],
+              userErrors: [],
+            },
+          },
+          errors: [{ message: "The second visit was rejected", path: ["visitCreate", "visits", 1] }],
+        })
+      )
+    );
+
+    await expect(jobberGraphQLWrite("mutation { visitCreate { createdVisits { id } userErrors { message path } } }", undefined, 10)).resolves.toEqual({
+      visitCreate: {
+        createdVisits: [{ id: "visit-created" }],
+        userErrors: [{ message: "The second visit was rejected", path: ["visitCreate", "visits", "1"] }],
+      },
+    });
   });
 
   it("throws JobberPermissionError with a pricing-page link for plan/permission errors", async () => {
@@ -302,7 +330,7 @@ describe("jobberGraphQL - GraphQL errors", () => {
       )
     );
 
-    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(JobberApiError);
+    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(JobberGraphQLRequestError);
     expect(getGovernorForSession(sessionId).getState().currentlyAvailable).toBe(1234);
   });
 
@@ -317,7 +345,7 @@ describe("jobberGraphQL - GraphQL errors", () => {
     );
 
     const err = await jobberGraphQL("query { x }", undefined, 10).catch((e) => e);
-    expect(err).toBeInstanceOf(JobberApiError);
+    expect(err).toBeInstanceOf(JobberGraphQLRequestError);
     expect(err).not.toBeInstanceOf(JobberPermissionError);
     expect(err.message).toContain("This visit has no plan assigned");
   });
@@ -329,7 +357,7 @@ describe("jobberGraphQL - HTTP 401", () => {
     mockGetValidAccessToken.mockResolvedValue("t");
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(401, {})));
 
-    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(JobberApiError);
+    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(JobberAuthenticationError);
     await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(/401.*authenticate/i);
   });
 
@@ -342,7 +370,7 @@ describe("jobberGraphQL - HTTP 401", () => {
     );
 
     const err = await jobberGraphQL("query { x }", undefined, 10).catch((e) => e);
-    expect(err).toBeInstanceOf(JobberApiError);
+    expect(err).toBeInstanceOf(JobberAuthenticationError);
     expect(err.message).toMatch(/401.*authenticate/i);
     expect(err).not.toBeInstanceOf(JobberPermissionError);
   });
@@ -482,10 +510,13 @@ describe("jobberGraphQL - HTTP 5xx", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const resultPromise = jobberGraphQL("query { x }", undefined, 10);
-    const assertion = expect(resultPromise).rejects.toThrow(/Internal error processing request/);
+    const errorPromise = resultPromise.catch((error) => error);
     await vi.advanceTimersByTimeAsync(1000);
     await vi.advanceTimersByTimeAsync(2000);
-    await assertion;
+    const error = await errorPromise;
+    expect(error).toBeInstanceOf(JobberApiError);
+    expect(error).not.toBeInstanceOf(JobberGraphQLRequestError);
+    expect(error.message).toMatch(/Internal error processing request/);
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 

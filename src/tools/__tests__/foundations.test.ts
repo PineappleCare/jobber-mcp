@@ -31,7 +31,9 @@ function fakeServer() {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  mockRead.mockReset();
+  mockWrite.mockReset();
+  mockAudit.mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -185,8 +187,6 @@ describe("foundational operations", () => {
     const server = fakeServer();
     registerFoundationalTools(server as any);
     const read = JSON.parse((await server.handlers.get_record({ record_type: "visit", record_id: "visit-1" })).content[0].text);
-    mockRead.mockResolvedValueOnce({ visit });
-
     const result = await server.handlers.update_visit({
       visit_id: "visit-1", expected_record_version: read.record_version,
       title: "Changed", assigned_user_ids: ["user-1"], confirm_write: true,
@@ -533,12 +533,50 @@ describe("foundational operations", () => {
     const server = fakeServer();
     registerFoundationalTools(server as any);
     const read = JSON.parse((await server.handlers.get_record({ record_type: "visit", record_id: "visit-1" })).content[0].text);
-    mockRead.mockResolvedValueOnce({ visit: before });
+    mockRead.mockResolvedValueOnce({ visit: before }).mockResolvedValueOnce({ visit: after });
     mockWrite.mockResolvedValueOnce({ visitEditSchedule: { visit: after, userErrors: [] } });
 
     const result = await server.handlers.update_visit({ visit_id: "visit-1", expected_record_version: read.record_version, schedule: { mode: "anytime", start_date: "2026-09-18", timezone: "America/Toronto" }, confirm_write: true });
 
     expect(JSON.parse(result.content[0].text).record.schedule.mode).toBe("anytime");
     expect(mockWrite.mock.calls[0][1].input).toEqual({ startAt: { date: "2026-09-18", timezone: "America/Toronto" }, endAt: { date: "2026-09-18", timezone: "America/Toronto" } });
+  });
+
+  it("reports a visit update readback mismatch instead of claiming success", async () => {
+    process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
+    const before = { id: "visit-1", title: "Original", visitStatus: "SCHEDULED", isComplete: false, completedAt: null, allDay: false, startAt: null, endAt: null, instructions: null, job: { id: "job-1" }, client: { id: "client-1" }, assignedUsers: { nodes: [] } };
+    const mutationRecord = { ...before, title: "Requested" };
+    mockRead.mockResolvedValueOnce({ visit: before });
+    const server = fakeServer();
+    registerFoundationalTools(server as any);
+    const read = JSON.parse((await server.handlers.get_record({ record_type: "visit", record_id: "visit-1" })).content[0].text);
+    mockRead.mockResolvedValueOnce({ visit: before }).mockResolvedValueOnce({ visit: before });
+    mockWrite.mockResolvedValueOnce({ visitEdit: { visit: mutationRecord, userErrors: [] } });
+
+    const result = await server.handlers.update_visit({ visit_id: "visit-1", expected_record_version: read.record_version, title: "Requested", confirm_write: true });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ outcome: "mismatch", record: { id: "visit-1", title: "Original" } });
+    expect(mockAudit).toHaveBeenCalledWith(expect.objectContaining({ tool: "update_visit", outcome: "partial" }));
+  });
+
+  it("preserves the mutation record when visit update verification cannot be read", async () => {
+    process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
+    const before = { id: "visit-1", title: "Original", visitStatus: "SCHEDULED", isComplete: false, completedAt: null, allDay: false, startAt: null, endAt: null, instructions: null, job: { id: "job-1" }, client: { id: "client-1" }, assignedUsers: { nodes: [] } };
+    const mutationRecord = { ...before, title: "Requested" };
+    mockRead.mockResolvedValueOnce({ visit: before });
+    const server = fakeServer();
+    registerFoundationalTools(server as any);
+    const read = JSON.parse((await server.handlers.get_record({ record_type: "visit", record_id: "visit-1" })).content[0].text);
+    mockRead.mockResolvedValueOnce({ visit: before }).mockRejectedValueOnce(new Error("readback unavailable"));
+    mockWrite.mockResolvedValueOnce({ visitEdit: { visit: mutationRecord, userErrors: [] } });
+
+    const result = await server.handlers.update_visit({ visit_id: "visit-1", expected_record_version: read.record_version, title: "Requested", confirm_write: true });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ outcome: "uncertain", record: { id: "visit-1", title: "Requested" }, verification_error: "readback unavailable" });
+    expect(mockWrite).toHaveBeenCalledTimes(1);
   });
 });
