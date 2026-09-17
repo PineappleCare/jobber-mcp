@@ -28,6 +28,17 @@ export class JobberPermissionError extends Error {
   }
 }
 
+/**
+ * A write request failed after it may have reached Jobber. Callers must
+ * reconcile through reads and must never retry the mutation automatically.
+ */
+export class JobberOutcomeUncertainError extends JobberApiError {
+  constructor(message: string) {
+    super(message);
+    this.name = "JobberOutcomeUncertainError";
+  }
+}
+
 const MAX_THROTTLE_RETRIES = 1;
 const MAX_429_RETRIES = 3;
 const DEFAULT_429_BACKOFF_MS = [1000, 2000, 4000];
@@ -228,11 +239,22 @@ async function executeGraphQL<T = any>(
 
   try {
     for (;;) {
-      const { status, retryAfterHeader, body, parseFailed } = await postOnce(token, query, variables);
+      let response: RawGraphQLResponse;
+      try {
+        response = await postOnce(token, query, variables);
+      } catch (error: any) {
+        if (isMutation) {
+          throw new JobberOutcomeUncertainError(
+            `${error.message} The write outcome is unknown; check Jobber before trying again.`
+          );
+        }
+        throw error;
+      }
+      const { status, retryAfterHeader, body, parseFailed } = response;
 
       if (status === 429) {
         if (isMutation) {
-          throw new JobberApiError(
+          throw new JobberOutcomeUncertainError(
             "Jobber rate-limited this write before a result was returned. Its outcome is unknown; check Jobber before trying again."
           );
         }
@@ -253,7 +275,7 @@ async function executeGraphQL<T = any>(
 
       if (isThrottled(body)) {
         if (isMutation) {
-          throw new JobberApiError(
+          throw new JobberOutcomeUncertainError(
             "Jobber throttled this write before a result was returned. Its outcome is unknown; check Jobber before trying again."
           );
         }
@@ -289,7 +311,7 @@ async function executeGraphQL<T = any>(
       // returning a gateway error. Checked ahead of the errors-array/generic-status branches so
       // a 5xx with an errors array follows the same safe mutation behavior.
       if (isMutation && status >= 500) {
-        throw new JobberApiError(
+        throw new JobberOutcomeUncertainError(
           "Jobber returned a server error for this write. Its outcome is unknown; check Jobber before trying again."
         );
       }
@@ -314,6 +336,11 @@ async function executeGraphQL<T = any>(
       }
 
       if (parseFailed) {
+        if (isMutation) {
+          throw new JobberOutcomeUncertainError(
+            "Jobber returned a non-JSON response for this write. Its outcome is unknown; check Jobber before trying again."
+          );
+        }
         throw new JobberApiError("Jobber API returned a non-JSON response");
       }
 
@@ -323,6 +350,11 @@ async function executeGraphQL<T = any>(
       }
 
       if (body?.data === undefined) {
+        if (isMutation) {
+          throw new JobberOutcomeUncertainError(
+            "Jobber returned no result for this write. Its outcome is unknown; check Jobber before trying again."
+          );
+        }
         throw new JobberApiError("Jobber API response had no data field");
       }
 

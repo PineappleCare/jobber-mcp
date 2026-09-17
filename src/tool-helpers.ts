@@ -148,17 +148,27 @@ function auditValidationFailures<T extends z.ZodTypeAny>(schema: T, toolName: st
   }) as T;
 }
 
-function toolErrorPayload(message: string): string {
-  const lower = message.toLowerCase();
-  const errorType = lower.includes("outcome is unknown") || lower.includes("outcome may be unknown")
+function toolErrorPayload(error: unknown): string {
+  const err = error instanceof Error ? error : new Error(String(error));
+  const errorType = err.name === "JobberOutcomeUncertainError"
     ? "outcome_uncertain"
-    : lower.startsWith("jobber rejected")
+    : err.name === "JobberRejectedError" || err.name === "JobberPermissionError"
       ? "jobber_rejected"
-      : lower.includes("jobber api request failed") || lower.includes("access token was rejected") || lower.includes("authenticate tool")
+      : ["JobberApiError", "BudgetUnavailableError", "RequestRateLimitError"].includes(err.name)
         ? "connection_unavailable"
         : "invalid_request";
-  return JSON.stringify({ outcome: "error", error_type: errorType, error: message });
+  return JSON.stringify({ outcome: "error", error_type: errorType, error: err.message });
 }
+
+/**
+ * Write tools often perform read-only preflight and verification queries. Only
+ * actual GraphQL mutations use the no-retry executor; queries keep the normal
+ * bounded read retry behavior.
+ */
+const jobberGraphQLForWriteTool: GraphQLExecutor = (query, variables, maxCost) =>
+  /^\s*mutation\b/i.test(query)
+    ? jobberGraphQLWrite(query, variables, maxCost)
+    : jobberGraphQL(query, variables, maxCost);
 
 /**
  * Registers a read-only tool. Wraps the handler with the standard
@@ -207,7 +217,7 @@ function registerTool<
       } catch (err: any) {
         await appendAuditLog({ tool: name, args: args ?? {}, outcome: "error", error_message: err.message });
         return {
-          content: [{ type: "text", text: toolErrorPayload(err.message) }],
+          content: [{ type: "text", text: toolErrorPayload(err) }],
           isError: true,
         };
       }
@@ -269,6 +279,6 @@ export function registerWriteTool<
       },
     },
     handler,
-    jobberGraphQLWrite
+    jobberGraphQLForWriteTool
   );
 }

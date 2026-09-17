@@ -17,6 +17,7 @@ import {
   jobberGraphQL,
   jobberGraphQLWrite,
   JobberApiError,
+  JobberOutcomeUncertainError,
   JobberPermissionError,
   getGovernorForSession,
   getGovernorForAccount,
@@ -506,7 +507,7 @@ describe("jobberGraphQLWrite - ambiguous outcomes", () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(500, {}));
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(jobberGraphQLWrite("mutation { x }", undefined, 10)).rejects.toThrow(/outcome is unknown/i);
+    await expect(jobberGraphQLWrite("mutation { x }", undefined, 10)).rejects.toBeInstanceOf(JobberOutcomeUncertainError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -516,7 +517,7 @@ describe("jobberGraphQLWrite - ambiguous outcomes", () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(429, {}));
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(jobberGraphQLWrite("mutation { x }", undefined, 10)).rejects.toThrow(/outcome is unknown/i);
+    await expect(jobberGraphQLWrite("mutation { x }", undefined, 10)).rejects.toBeInstanceOf(JobberOutcomeUncertainError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -528,7 +529,7 @@ describe("jobberGraphQLWrite - ambiguous outcomes", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(jobberGraphQLWrite("mutation { x }", undefined, 10)).rejects.toThrow(/outcome is unknown/i);
+    await expect(jobberGraphQLWrite("mutation { x }", undefined, 10)).rejects.toBeInstanceOf(JobberOutcomeUncertainError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

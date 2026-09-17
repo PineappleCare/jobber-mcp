@@ -10,6 +10,13 @@ export interface MutationPayload {
   [key: string]: unknown;
 }
 
+export class JobberRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "JobberRejectedError";
+  }
+}
+
 export function assertMutationAccepted<T extends MutationPayload>(
   action: string,
   payload: T
@@ -18,7 +25,7 @@ export function assertMutationAccepted<T extends MutationPayload>(
     const detail = payload.userErrors
       .map((error) => `${error.path?.length ? `${error.path.join(".")}: ` : ""}${error.message}`)
       .join("; ");
-    throw new Error(`Jobber rejected ${action}: ${detail}`);
+    throw new JobberRejectedError(`Jobber rejected ${action}: ${detail}`);
   }
   return payload;
 }

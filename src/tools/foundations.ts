@@ -396,6 +396,17 @@ function localInstant(date: string, time: string, timezone: string, label: strin
   return unique[0];
 }
 
+function calendarDateInTimezone(value: unknown, timezone: string): string | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const instant = Date.parse(value);
+  if (!Number.isFinite(instant)) return undefined;
+  const shown = Object.fromEntries(
+    timezoneFormatter(timezone).formatToParts(instant).map((part) => [part.type, part.value])
+  );
+  return `${shown.year}-${shown.month}-${shown.day}`;
+}
+
 function normalizeVisitSchedule(args: any): NormalizedVisitSchedule {
   if (args.schedule !== undefined && (args.start_at !== undefined || args.end_at !== undefined)) {
     throw new Error("Use schedule or the legacy start_at/end_at fields, not both.");
@@ -449,7 +460,9 @@ function visitMatchesSchedule(visit: Node, schedule: NormalizedVisitSchedule, ti
   }
   if (!visit.startAt || !visit.endAt) return false;
   if (schedule.mode === "anytime") {
-    return visit.allDay === true && String(visit.startAt).slice(0, 10) === schedule.startAt.date && String(visit.endAt).slice(0, 10) === schedule.endAt.date;
+    return visit.allDay === true
+      && calendarDateInTimezone(visit.startAt, schedule.startAt.timezone) === schedule.startAt.date
+      && calendarDateInTimezone(visit.endAt, schedule.endAt.timezone) === schedule.endAt.date;
   }
   return visit.allDay !== true && Date.parse(visit.startAt) === schedule.startInstant && Date.parse(visit.endAt) === schedule.endInstant;
 }
@@ -501,7 +514,10 @@ async function assertSchedulableUsers(requestedIds: string[], run: any): Promise
     if (!cursor) throw new Error("Jobber did not provide a cursor while validating team members; no write was attempted.");
   }
   if (!complete) throw new Error("The account has too many team members to safely validate assignments; no write was attempted.");
-  const invalid = requestedIds.filter((id) => !users.has(id) || users.get(id)?.availableForScheduling === false || normalized(users.get(id)?.status) === "inactive");
+  const invalid = requestedIds.filter((id) => {
+    const user = users.get(id);
+    return !user || user.availableForScheduling !== true || normalized(user.status) !== "activated";
+  });
   if (invalid.length) throw new Error(`These team member IDs are missing or unavailable for scheduling: ${invalid.join(", ")}. No write was attempted.`);
 }
 
@@ -513,9 +529,9 @@ function errorInputIndex(error: Node): number | undefined {
   for (const part of error.path ?? []) if (/^\d+$/.test(String(part))) return Number(part);
 }
 
-function matchVisitResults(prepared: any[], created: Node[], errors: Node[]): any[] {
+function matchVisitResults(prepared: any[], created: Node[], errors: Node[]): { results: any[]; unmatchedCreated: Node[] } {
   const remaining = [...created];
-  return prepared.map((item, inputIndex) => {
+  const results = prepared.map((item, inputIndex) => {
     const createdIndex = remaining.findIndex((visit) => visitMatchesSchedule(visit, item.normalizedSchedule, item.title));
     if (createdIndex >= 0) {
       const [record] = remaining.splice(createdIndex, 1);
@@ -526,17 +542,26 @@ function matchVisitResults(prepared: any[], created: Node[], errors: Node[]): an
       ? { input_index: inputIndex, status: "rejected", errors: itemErrors }
       : { input_index: inputIndex, status: "uncertain", errors };
   });
+  return { results, unmatchedCreated: remaining.map(visitWithSchedule) };
 }
 
 function toolResult(payload: Node, isError = false) {
   return { content: [{ type: "text" as const, text: JSON.stringify(payload) }], ...(isError ? { isError: true } : {}) };
 }
 
-async function auditVisitBatch(tool: string, jobId: string, specs: any[], created: Node[]): Promise<void> {
+async function auditVisitBatch(
+  tool: string,
+  jobId: string,
+  specs: any[],
+  created: Node[],
+  outcome: "success" | "partial" | "error",
+  errorMessage?: string
+): Promise<void> {
   await appendAuditLog({
     tool,
     args: { action: tool, record_type: "visit", source_record_ids: { job_id: jobId }, requested_count: specs.length, created_record_ids: created.map((visit) => visit.id) },
-    outcome: "success",
+    outcome,
+    ...(errorMessage ? { error_message: errorMessage } : {}),
     result_count: created.length,
   });
 }
@@ -556,6 +581,14 @@ function registerSchedulingWrites(server: McpServer): void {
     start_at: localTime.optional().describe("Legacy schedule input; prefer schedule."),
     end_at: localTime.optional().describe("Legacy schedule input; prefer schedule."),
     assigned_user_ids: z.array(z.string().min(1)).max(20).default([]),
+  }).superRefine((value, ctx) => {
+    if (value.schedule === undefined && value.start_at === undefined && value.end_at === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["schedule"],
+        message: "Choose an explicit schedule mode, including mode=unscheduled when no date is wanted.",
+      });
+    }
   });
 
   const createOne = async (tool: string, jobId: string, specs: any[], run: any) => {
@@ -582,15 +615,18 @@ function registerSchedulingWrites(server: McpServer): void {
         input: { visits: prepared.map((item) => ({ title: item.title, instructions: item.instructions, schedule: jobberSchedule(item.normalizedSchedule, item.assigned_user_ids) })) },
       });
     } catch (error: any) {
+      await auditVisitBatch(tool, jobId, specs, [], "error", "mutation outcome uncertain; reconciliation required");
       return toolResult({ action: "create", record_type: "visit", outcome: "uncertain", error: error.message, guidance: "The write was not retried. Re-read the job and check Jobber before requesting another write." }, true);
     }
 
     const payload = data.visitCreate;
     if (!payload || !Array.isArray(payload.createdVisits) || !Array.isArray(payload.userErrors)) {
+      await auditVisitBatch(tool, jobId, specs, [], "error", "incomplete mutation response; reconciliation required");
       return toolResult({ action: "create", record_type: "visit", outcome: "uncertain", error: "Jobber returned an incomplete visit creation result.", guidance: "Re-read the job and check Jobber before requesting another write." }, true);
     }
     const created = payload.createdVisits as Node[];
-    const results = matchVisitResults(prepared, created, payload.userErrors);
+    const { results, unmatchedCreated } = matchVisitResults(prepared, created, payload.userErrors);
+    let verificationError: string | undefined;
     try {
       const after = await loadVisitPreflight(jobId, run);
       const byId = new Map(after.visits.map((visit: Node) => [visit.id, visit]));
@@ -603,12 +639,32 @@ function registerSchedulingWrites(server: McpServer): void {
           : "mismatch";
         if (readback) result.record = visitWithSchedule(readback);
       }
-    } catch {
-      for (const result of results) if (result.status === "created") result.verification = "uncertain";
+    } catch (error: any) {
+      verificationError = error instanceof Error ? error.message : String(error);
+      for (const result of results) {
+        if (result.status !== "created") continue;
+        result.verification = "uncertain";
+        result.verification_error = verificationError;
+      }
     }
-    const complete = results.every((result) => result.status === "created" && result.verification === "verified");
-    await auditVisitBatch(tool, jobId, specs, created);
-    return toolResult({ action: "create", record_type: "visit", outcome: complete ? "created" : "partial", job_id: jobId, results, user_errors: payload.userErrors });
+    const complete = payload.userErrors.length === 0
+      && unmatchedCreated.length === 0
+      && results.every((result) => result.status === "created" && result.verification === "verified");
+    const auditOutcome = complete ? "success" : created.length ? "partial" : "error";
+    const issueSummary = complete
+      ? undefined
+      : `created=${created.length}, user_errors=${payload.userErrors.length}, unmatched_created=${unmatchedCreated.length}${verificationError ? ", verification_failed=true" : ""}`;
+    await auditVisitBatch(tool, jobId, specs, created, auditOutcome, issueSummary);
+    return toolResult({
+      action: "create",
+      record_type: "visit",
+      outcome: complete ? "created" : "partial",
+      job_id: jobId,
+      results,
+      user_errors: payload.userErrors,
+      ...(unmatchedCreated.length ? { unmatched_created_records: unmatchedCreated } : {}),
+      ...(verificationError ? { verification_error: verificationError } : {}),
+    }, !complete);
   };
 
   registerWriteTool(server, "create_visit", { description: "Create one Jobber visit. Use schedule.mode=anytime for a date with no time, timed for exact times, or unscheduled for no date.", capability: "scheduling", inputSchema: { job_id: z.string().min(1), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), schedule: schedule.optional(), start_at: localTime.optional(), end_at: localTime.optional(), assigned_user_ids: z.array(z.string().min(1)).max(20).default([]), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => createOne("create_visit", args.job_id, [args], run));

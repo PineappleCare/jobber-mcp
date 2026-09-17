@@ -104,7 +104,7 @@ export interface AuditEntry {
   machine_ip?: string;
   tool: string;
   args: Record<string, unknown>;
-  outcome: "success" | "error" | "not_found";
+  outcome: "success" | "partial" | "error" | "not_found";
   error_message?: string;
   account_id?: string;
   result_count?: number;

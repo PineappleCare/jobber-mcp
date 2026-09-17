@@ -275,4 +275,52 @@ describe("registerWriteTool", () => {
     );
     expect(mockJobberGraphQL).not.toHaveBeenCalled();
   });
+
+  it("routes write-tool preflight queries through the retrying read executor", async () => {
+    process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "records";
+    const server = fakeServer();
+    registerWriteTool(
+      server as any,
+      "create_client",
+      { description: "x", capability: "records", maxCost: 100 },
+      async (_args, run) => {
+        await run("query { clients { id } }", {});
+        await run("mutation { createClient { id } }", { input: {} });
+        return { content: [{ type: "text", text: "ok" }] };
+      }
+    );
+
+    await server.handlers.create_client({});
+
+    expect(mockJobberGraphQL).toHaveBeenCalledWith("query { clients { id } }", {}, 100);
+    expect(mockJobberGraphQLWrite).toHaveBeenCalledWith("mutation { createClient { id } }", { input: {} }, 100);
+  });
+
+  it.each([
+    ["JobberOutcomeUncertainError", "outcome_uncertain"],
+    ["JobberRejectedError", "jobber_rejected"],
+    ["JobberPermissionError", "jobber_rejected"],
+    ["JobberApiError", "connection_unavailable"],
+    ["BudgetUnavailableError", "connection_unavailable"],
+    ["Error", "invalid_request"],
+  ])("classifies %s without relying on message text", async (name, expectedType) => {
+    process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "records";
+    const server = fakeServer();
+    registerWriteTool(
+      server as any,
+      "create_client",
+      { description: "x", capability: "records", maxCost: 100 },
+      async () => {
+        const error = new Error("same message");
+        error.name = name;
+        throw error;
+      }
+    );
+
+    const result = await server.handlers.create_client({});
+
+    expect(JSON.parse(result.content[0].text).error_type).toBe(expectedType);
+  });
 });

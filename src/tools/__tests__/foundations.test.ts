@@ -117,9 +117,8 @@ describe("foundational operations", () => {
   it("returns the sole created property, rather than Jobber's enclosing list", async () => {
     process.env.JOBBER_READ_ONLY = "false";
     process.env.JOBBER_WRITE_CAPABILITIES = "records";
-    mockWrite
-      .mockResolvedValueOnce({ client: { id: "client-1", properties: [] } })
-      .mockResolvedValueOnce({
+    mockRead.mockResolvedValueOnce({ client: { id: "client-1", properties: [] } });
+    mockWrite.mockResolvedValueOnce({
         propertyCreate: { userErrors: [], properties: [{ id: "property-1", name: "Test property" }] },
       });
     const server = fakeServer();
@@ -142,9 +141,8 @@ describe("foundational operations", () => {
   it("refuses a multi-property response as an ambiguous outcome", async () => {
     process.env.JOBBER_READ_ONLY = "false";
     process.env.JOBBER_WRITE_CAPABILITIES = "records";
-    mockWrite
-      .mockResolvedValueOnce({ client: { id: "client-1", properties: [] } })
-      .mockResolvedValueOnce({
+    mockRead.mockResolvedValueOnce({ client: { id: "client-1", properties: [] } });
+    mockWrite.mockResolvedValueOnce({
         propertyCreate: { userErrors: [], properties: [{ id: "property-1" }, { id: "property-2" }] },
       });
     const server = fakeServer();
@@ -163,7 +161,7 @@ describe("foundational operations", () => {
   it("rejects a property that does not belong to a request client before mutating", async () => {
     process.env.JOBBER_READ_ONLY = "false";
     process.env.JOBBER_WRITE_CAPABILITIES = "records";
-    mockWrite.mockResolvedValueOnce({ client: { id: "client-1", properties: [], requests: { nodes: [] } } });
+    mockRead.mockResolvedValueOnce({ client: { id: "client-1", properties: [], requests: { nodes: [] } } });
     const server = fakeServer();
     registerFoundationalTools(server as any);
 
@@ -171,7 +169,8 @@ describe("foundational operations", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("does not belong");
-    expect(mockWrite).toHaveBeenCalledTimes(1);
+    expect(mockRead).toHaveBeenCalledTimes(1);
+    expect(mockWrite).not.toHaveBeenCalled();
   });
 
   it("refuses a multi-aspect visit update before any partial mutation", async () => {
@@ -186,7 +185,7 @@ describe("foundational operations", () => {
     const server = fakeServer();
     registerFoundationalTools(server as any);
     const read = JSON.parse((await server.handlers.get_record({ record_type: "visit", record_id: "visit-1" })).content[0].text);
-    mockWrite.mockResolvedValueOnce({ visit });
+    mockRead.mockResolvedValueOnce({ visit });
 
     const result = await server.handlers.update_visit({
       visit_id: "visit-1", expected_record_version: read.record_version,
@@ -195,7 +194,7 @@ describe("foundational operations", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("exactly one visit aspect");
-    expect(mockWrite).toHaveBeenCalledTimes(1);
+    expect(mockWrite).not.toHaveBeenCalled();
   });
 
   it("creates and verifies a same-day Anytime visit using date-only Jobber values", async () => {
@@ -207,7 +206,8 @@ describe("foundational operations", () => {
       job: { id: "job-1" }, client: { id: "client-1" }, assignedUsers: { nodes: [] },
     };
     const page = (nodes: any[]) => ({ job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } });
-    mockWrite.mockResolvedValueOnce(page([])).mockResolvedValueOnce({ visitCreate: { createdVisits: [visit], userErrors: [] } }).mockResolvedValueOnce(page([visit]));
+    mockRead.mockResolvedValueOnce(page([])).mockResolvedValueOnce(page([visit]));
+    mockWrite.mockResolvedValueOnce({ visitCreate: { createdVisits: [visit], userErrors: [] } });
     const server = fakeServer();
     registerFoundationalTools(server as any);
 
@@ -219,7 +219,7 @@ describe("foundational operations", () => {
 
     const payload = JSON.parse(result.content[0].text);
     expect(payload).toMatchObject({ outcome: "created", results: [{ status: "created", verification: "verified", record: { schedule: { mode: "anytime" } } }] });
-    expect(mockWrite.mock.calls[1][1].input.visits[0].schedule).toEqual({
+    expect(mockWrite.mock.calls[0][1].input.visits[0].schedule).toEqual({
       startAt: { date: "2026-09-18", timezone: "America/Toronto" },
       endAt: { date: "2026-09-18", timezone: "America/Toronto" },
       teamMemberIdsToAssign: [], notifyTeam: false,
@@ -231,7 +231,8 @@ describe("foundational operations", () => {
     process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
     const visit = { id: "visit-legacy", title: "Legacy", allDay: true, startAt: "2026-09-18T00:00:00-04:00", endAt: "2026-09-18T00:00:00-04:00", assignedUsers: { nodes: [] } };
     const page = (nodes: any[]) => ({ job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } });
-    mockWrite.mockResolvedValueOnce(page([])).mockResolvedValueOnce({ visitCreate: { createdVisits: [visit], userErrors: [] } }).mockResolvedValueOnce(page([visit]));
+    mockRead.mockResolvedValueOnce(page([])).mockResolvedValueOnce(page([visit]));
+    mockWrite.mockResolvedValueOnce({ visitCreate: { createdVisits: [visit], userErrors: [] } });
     const server = fakeServer();
     registerFoundationalTools(server as any);
 
@@ -252,11 +253,11 @@ describe("foundational operations", () => {
     const users = [{ id: "matt" }, { id: "ryan" }];
     const visits = dates.map((date, index) => ({ id: `visit-${index}`, title: "Rough-in", allDay: true, startAt: `${date}T00:00:00-04:00`, endAt: `${date}T00:00:00-04:00`, assignedUsers: { nodes: users } }));
     const page = (nodes: any[]) => ({ job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } });
-    mockWrite
+    mockRead
       .mockResolvedValueOnce(page([]))
-      .mockResolvedValueOnce({ users: { nodes: users.map((user) => ({ ...user, availableForScheduling: true, status: "ACTIVE" })), pageInfo: { hasNextPage: false, endCursor: null } } })
-      .mockResolvedValueOnce({ visitCreate: { createdVisits: visits, userErrors: [] } })
+      .mockResolvedValueOnce({ users: { nodes: users.map((user) => ({ ...user, availableForScheduling: true, status: "ACTIVATED" })), pageInfo: { hasNextPage: false, endCursor: null } } })
       .mockResolvedValueOnce(page(visits));
+    mockWrite.mockResolvedValueOnce({ visitCreate: { createdVisits: visits, userErrors: [] } });
     const server = fakeServer();
     registerFoundationalTools(server as any);
 
@@ -273,14 +274,75 @@ describe("foundational operations", () => {
     expect(mockWrite.mock.calls.filter(([query]) => query.includes("mutation CreateVisits"))).toHaveLength(1);
   });
 
+  it("requires every batch item to state its schedule mode explicitly", async () => {
+    process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
+    const server = fakeServer();
+    registerFoundationalTools(server as any);
+
+    const result = await server.configs.create_visits.inputSchema["~standard"].validate({
+      job_id: "job-1",
+      visits: [{ title: "Missing schedule" }],
+      confirm_write: true,
+    });
+
+    expect(result.issues?.map((issue: any) => issue.message).join(" ")).toContain("explicit schedule mode");
+    expect(mockRead).not.toHaveBeenCalled();
+    expect(mockWrite).not.toHaveBeenCalled();
+  });
+
+  it("rejects deactivated team members before mutation", async () => {
+    process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
+    const page = { job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } };
+    mockRead
+      .mockResolvedValueOnce(page)
+      .mockResolvedValueOnce({ users: { nodes: [{ id: "former", availableForScheduling: true, status: "DEACTIVATED" }], pageInfo: { hasNextPage: false, endCursor: null } } });
+    const server = fakeServer();
+    registerFoundationalTools(server as any);
+
+    const result = await server.handlers.create_visit({
+      job_id: "job-1",
+      schedule: { mode: "anytime", start_date: "2026-09-18", timezone: "America/Toronto" },
+      assigned_user_ids: ["former"],
+      confirm_write: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("unavailable for scheduling");
+    expect(mockWrite).not.toHaveBeenCalled();
+  });
+
+  it("compares Anytime readback dates in the requested timezone", async () => {
+    process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
+    const visit = { id: "visit-zone", title: "Evening UTC", allDay: true, startAt: "2026-09-19T02:00:00Z", endAt: "2026-09-19T02:00:00Z", assignedUsers: { nodes: [] } };
+    const page = (nodes: any[]) => ({ job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } });
+    mockRead.mockResolvedValueOnce(page([])).mockResolvedValueOnce(page([visit]));
+    mockWrite.mockResolvedValueOnce({ visitCreate: { createdVisits: [visit], userErrors: [] } });
+    const server = fakeServer();
+    registerFoundationalTools(server as any);
+
+    const result = await server.handlers.create_visit({
+      job_id: "job-1",
+      title: "Evening UTC",
+      schedule: { mode: "anytime", start_date: "2026-09-18", timezone: "America/Toronto" },
+      assigned_user_ids: [],
+      confirm_write: true,
+    });
+
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ outcome: "created", results: [{ verification: "verified" }] });
+  });
+
   it("reports partial batch results without discarding created visit IDs", async () => {
     process.env.JOBBER_READ_ONLY = "false";
     process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
     const visit = { id: "visit-1", title: "First", allDay: true, startAt: "2026-09-18T00:00:00-04:00", endAt: "2026-09-18T00:00:00-04:00", assignedUsers: { nodes: [] } };
     const page = (nodes: any[]) => ({ job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } });
-    mockWrite.mockResolvedValueOnce(page([])).mockResolvedValueOnce({
+    mockRead.mockResolvedValueOnce(page([])).mockResolvedValueOnce(page([visit]));
+    mockWrite.mockResolvedValueOnce({
       visitCreate: { createdVisits: [visit], userErrors: [{ message: "Invalid second visit", path: ["input", "visits", "1"] }] },
-    }).mockResolvedValueOnce(page([visit]));
+    });
     const server = fakeServer();
     registerFoundationalTools(server as any);
 
@@ -296,6 +358,57 @@ describe("foundational operations", () => {
       { input_index: 0, status: "created", verification: "verified", record: { id: "visit-1" } },
       { input_index: 1, status: "rejected" },
     ] });
+    expect(result.isError).toBe(true);
+    expect(mockAudit).toHaveBeenCalledWith(expect.objectContaining({ outcome: "partial", result_count: 1 }));
+  });
+
+  it("reports every returned record even when it cannot match an input", async () => {
+    process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
+    const unexpected = { id: "visit-unmatched", title: "Unexpected", allDay: true, startAt: "2026-09-20T00:00:00-04:00", endAt: "2026-09-20T00:00:00-04:00", assignedUsers: { nodes: [] } };
+    const page = (nodes: any[]) => ({ job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } });
+    mockRead.mockResolvedValueOnce(page([])).mockResolvedValueOnce(page([unexpected]));
+    mockWrite.mockResolvedValueOnce({ visitCreate: { createdVisits: [unexpected], userErrors: [] } });
+    const server = fakeServer();
+    registerFoundationalTools(server as any);
+
+    const result = await server.handlers.create_visit({
+      job_id: "job-1",
+      schedule: { mode: "anytime", start_date: "2026-09-18", timezone: "America/Toronto" },
+      assigned_user_ids: [],
+      confirm_write: true,
+    });
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(payload).toMatchObject({
+      outcome: "partial",
+      results: [{ status: "uncertain" }],
+      unmatched_created_records: [{ id: "visit-unmatched" }],
+    });
+  });
+
+  it("does not call a batch complete when Jobber returns user errors alongside every record", async () => {
+    process.env.JOBBER_READ_ONLY = "false";
+    process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
+    const visit = { id: "visit-1", title: "First", allDay: true, startAt: "2026-09-18T00:00:00-04:00", endAt: "2026-09-18T00:00:00-04:00", assignedUsers: { nodes: [] } };
+    const page = (nodes: any[]) => ({ job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } });
+    mockRead.mockResolvedValueOnce(page([])).mockResolvedValueOnce(page([visit]));
+    mockWrite.mockResolvedValueOnce({ visitCreate: { createdVisits: [visit], userErrors: [{ message: "Global warning", path: [] }] } });
+    const server = fakeServer();
+    registerFoundationalTools(server as any);
+
+    const result = await server.handlers.create_visit({
+      job_id: "job-1",
+      title: "First",
+      schedule: { mode: "anytime", start_date: "2026-09-18", timezone: "America/Toronto" },
+      assigned_user_ids: [],
+      confirm_write: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ outcome: "partial", user_errors: [{ message: "Global warning" }] });
+    expect(mockAudit).toHaveBeenCalledWith(expect.objectContaining({ outcome: "partial" }));
   });
 
   it("rejects nonexistent and ambiguous local times before calling Jobber", async () => {
@@ -318,7 +431,8 @@ describe("foundational operations", () => {
     process.env.JOBBER_READ_ONLY = "false";
     process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
     const page = { job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } };
-    mockWrite.mockResolvedValueOnce(page).mockRejectedValueOnce(new Error("Jobber server error; outcome is unknown"));
+    mockRead.mockResolvedValueOnce(page);
+    mockWrite.mockRejectedValueOnce(new Error("Jobber server error; outcome is unknown"));
     const server = fakeServer();
     registerFoundationalTools(server as any);
 
@@ -326,14 +440,15 @@ describe("foundational operations", () => {
 
     expect(result.isError).toBe(true);
     expect(JSON.parse(result.content[0].text).outcome).toBe("uncertain");
-    expect(mockWrite).toHaveBeenCalledTimes(2);
+    expect(mockRead).toHaveBeenCalledTimes(1);
+    expect(mockWrite).toHaveBeenCalledTimes(1);
   });
 
   it("finds a duplicate visit beyond the first preflight page", async () => {
     process.env.JOBBER_READ_ONLY = "false";
     process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
     const connection = (nodes: any[], hasNextPage: boolean, endCursor: string | null) => ({ job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes, pageInfo: { hasNextPage, endCursor } } } });
-    mockWrite
+    mockRead
       .mockResolvedValueOnce(connection([{ id: "other", allDay: true, startAt: "2026-09-17T00:00:00-04:00", endAt: "2026-09-17T00:00:00-04:00" }], true, "next"))
       .mockResolvedValueOnce(connection([{ id: "duplicate", allDay: true, startAt: "2026-09-18T00:00:00-04:00", endAt: "2026-09-18T00:00:00-04:00" }], false, null));
     const server = fakeServer();
@@ -343,8 +458,8 @@ describe("foundational operations", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("already exists");
-    expect(mockWrite).toHaveBeenCalledTimes(2);
-    expect(mockWrite.mock.calls.some(([query]) => query.includes("mutation CreateVisits"))).toBe(false);
+    expect(mockRead).toHaveBeenCalledTimes(2);
+    expect(mockWrite).not.toHaveBeenCalled();
   });
 
   it("preserves assignments when creating an unscheduled visit", async () => {
@@ -353,18 +468,18 @@ describe("foundational operations", () => {
     const user = { id: "matt" };
     const visit = { id: "visit-unscheduled", title: "Schedule later", allDay: false, startAt: null, endAt: null, assignedUsers: { nodes: [user] } };
     const page = (nodes: any[]) => ({ job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } });
-    mockWrite
+    mockRead
       .mockResolvedValueOnce(page([]))
-      .mockResolvedValueOnce({ users: { nodes: [{ ...user, availableForScheduling: true, status: "ACTIVE" }], pageInfo: { hasNextPage: false, endCursor: null } } })
-      .mockResolvedValueOnce({ visitCreate: { createdVisits: [visit], userErrors: [] } })
+      .mockResolvedValueOnce({ users: { nodes: [{ ...user, availableForScheduling: true, status: "ACTIVATED" }], pageInfo: { hasNextPage: false, endCursor: null } } })
       .mockResolvedValueOnce(page([visit]));
+    mockWrite.mockResolvedValueOnce({ visitCreate: { createdVisits: [visit], userErrors: [] } });
     const server = fakeServer();
     registerFoundationalTools(server as any);
 
     const result = await server.handlers.create_visit({ job_id: "job-1", title: "Schedule later", schedule: { mode: "unscheduled" }, assigned_user_ids: ["matt"], confirm_write: true });
 
     expect(JSON.parse(result.content[0].text).outcome).toBe("created");
-    expect(mockWrite.mock.calls[2][1].input.visits[0].schedule).toEqual({ teamMemberIdsToAssign: ["matt"], notifyTeam: false });
+    expect(mockWrite.mock.calls[0][1].input.visits[0].schedule).toEqual({ teamMemberIdsToAssign: ["matt"], notifyTeam: false });
   });
 
   it("updates a reviewed visit to Anytime and returns an explicit schedule mode", async () => {
@@ -376,11 +491,12 @@ describe("foundational operations", () => {
     const server = fakeServer();
     registerFoundationalTools(server as any);
     const read = JSON.parse((await server.handlers.get_record({ record_type: "visit", record_id: "visit-1" })).content[0].text);
-    mockWrite.mockResolvedValueOnce({ visit: before }).mockResolvedValueOnce({ visitEditSchedule: { visit: after, userErrors: [] } });
+    mockRead.mockResolvedValueOnce({ visit: before });
+    mockWrite.mockResolvedValueOnce({ visitEditSchedule: { visit: after, userErrors: [] } });
 
     const result = await server.handlers.update_visit({ visit_id: "visit-1", expected_record_version: read.record_version, schedule: { mode: "anytime", start_date: "2026-09-18", timezone: "America/Toronto" }, confirm_write: true });
 
     expect(JSON.parse(result.content[0].text).record.schedule.mode).toBe("anytime");
-    expect(mockWrite.mock.calls[1][1].input).toEqual({ startAt: { date: "2026-09-18", timezone: "America/Toronto" }, endAt: { date: "2026-09-18", timezone: "America/Toronto" } });
+    expect(mockWrite.mock.calls[0][1].input).toEqual({ startAt: { date: "2026-09-18", timezone: "America/Toronto" }, endAt: { date: "2026-09-18", timezone: "America/Toronto" } });
   });
 });
