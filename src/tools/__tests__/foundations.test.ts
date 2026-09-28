@@ -140,6 +140,37 @@ describe("foundational operations", () => {
     }));
   });
 
+  it("returns note IDs, link state, and stable note versions in record reads", async () => {
+    mockRead.mockResolvedValueOnce({
+      job: {
+        id: "job-1",
+        jobNumber: 993,
+        notes: {
+          nodes: [{
+            id: "note-1",
+            message: "Customer details",
+            createdAt: "2026-09-28T12:00:00Z",
+            lastEditedAt: null,
+            pinned: true,
+            linkedTo: { invoices: true },
+          }],
+        },
+      },
+    });
+    const server = fakeServer();
+    registerFoundationalTools(server as any);
+
+    const response = await server.handlers.get_record({ record_type: "job", record_id: "job-1" });
+    const payload = JSON.parse(response.content[0].text);
+
+    expect(payload.record.notes.nodes[0]).toMatchObject({
+      id: "note-1",
+      pinned: true,
+      linkedTo: { requests: false, quotes: false, jobs: false, invoices: true },
+      note_version: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+    });
+  });
+
   it("refuses a multi-property response as an ambiguous outcome", async () => {
     process.env.JOBBER_READ_ONLY = "false";
     process.env.JOBBER_WRITE_CAPABILITIES = "records";

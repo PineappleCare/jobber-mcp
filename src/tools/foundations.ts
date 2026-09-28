@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { registerJobLineItemDescriptions } from "./job-line-item-descriptions.js";
+import { noteFields, recordWithNoteVersions } from "./notes.js";
 import { createHash } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { appendAuditLog } from "../utils/auditLog.js";
@@ -52,12 +53,12 @@ const SEARCHES: Record<z.infer<typeof recordTypeSchema>, string> = {
   visit: `query SearchVisits($first:Int!,$after:String){ visits(first:$first,after:$after){ totalCount nodes { ${visitFields} } pageInfo { hasNextPage endCursor } } }`,
 };
 const GETS: Record<z.infer<typeof recordTypeSchema>, string> = {
-  client: `query GetClient($id:EncodedId!){ client(id:$id){ ${clientFields} tags(first:20){nodes{label}} customFields { ... on CustomFieldText { valueText } } notes(first:20){nodes{ message createdAt }} } }`,
+  client: `query GetClient($id:EncodedId!){ client(id:$id){ ${clientFields} tags(first:20){nodes{label}} customFields { ... on CustomFieldText { valueText } } notes(first:20){nodes{ ${noteFields} }} } }`,
   property: `query GetProperty($id:EncodedId!){ property(id:$id){ ${propertyFields} client { id name } customFields { ... on CustomFieldText { valueText } } } }`,
-  request: `query GetRequest($id:EncodedId!){ request(id:$id){ ${requestFields} lineItems(first:50){nodes{id name description quantity unitPrice totalPrice}} notes(first:20){nodes{... on NoteInterface {message createdAt}}} } }`,
-  quote: `query GetQuote($id:EncodedId!){ quote(id:$id){ ${quoteFields} contractDisclaimer lineItems(first:50){nodes{id name description quantity unitPrice totalPrice taxable}} notes(first:20){nodes{... on NoteInterface {message createdAt}}} customFields { ... on CustomFieldText { valueText } } } }`,
-  job: `query GetJob($id:EncodedId!){ job(id:$id){ ${jobFields} visits(first:50){nodes{${visitFields}}} lineItems(first:50){nodes{id name description quantity unitPrice totalPrice taxable}} notes(first:20){nodes{... on NoteInterface {message createdAt}}} customFields { ... on CustomFieldText { valueText } } } }`,
-  invoice: `query GetInvoice($id:EncodedId!){ invoice(id:$id){ ${invoiceFields} message contractDisclaimer lineItems(first:50){nodes{id name description quantity unitPrice totalPrice taxable}} notes(first:20){nodes{... on NoteInterface {message createdAt}}} customFields { ... on CustomFieldText { valueText } } } }`,
+  request: `query GetRequest($id:EncodedId!){ request(id:$id){ ${requestFields} lineItems(first:50){nodes{id name description quantity unitPrice totalPrice}} notes(first:20){nodes{... on NoteInterface {${noteFields}}}} } }`,
+  quote: `query GetQuote($id:EncodedId!){ quote(id:$id){ ${quoteFields} contractDisclaimer lineItems(first:50){nodes{id name description quantity unitPrice totalPrice taxable}} notes(first:20){nodes{... on NoteInterface {${noteFields}}}} customFields { ... on CustomFieldText { valueText } } } }`,
+  job: `query GetJob($id:EncodedId!){ job(id:$id){ ${jobFields} visits(first:50){nodes{${visitFields}}} lineItems(first:50){nodes{id name description quantity unitPrice totalPrice taxable}} notes(first:20){nodes{... on NoteInterface {${noteFields}}}} customFields { ... on CustomFieldText { valueText } } } }`,
+  invoice: `query GetInvoice($id:EncodedId!){ invoice(id:$id){ ${invoiceFields} message contractDisclaimer lineItems(first:50){nodes{id name description quantity unitPrice totalPrice taxable}} notes(first:20){nodes{... on NoteInterface {${noteFields}}}} customFields { ... on CustomFieldText { valueText } } } }`,
   visit: `query GetVisit($id:EncodedId!){ visit(id:$id){ ${visitFields} lineItems(first:50){nodes{id name description quantity unitPrice totalPrice taxable}} } }`,
 };
 
@@ -95,9 +96,9 @@ function visitWithSchedule(record: Node): Node {
 function recordWithSchedules(recordType: string, record: Node): Node {
   if (recordType === "visit") return visitWithSchedule(record);
   if (recordType === "job" && Array.isArray(record.visits?.nodes)) {
-    return { ...record, visits: { ...record.visits, nodes: record.visits.nodes.map(visitWithSchedule) } };
+    return recordWithNoteVersions({ ...record, visits: { ...record.visits, nodes: record.visits.nodes.map(visitWithSchedule) } });
   }
-  return record;
+  return recordWithNoteVersions(record);
 }
 function response(action: string, recordType: string, record: Node) {
   return { content: [{ type: "text" as const, text: JSON.stringify({ action, record_type: recordType, record_version: recordVersion(recordType, record), record: recordWithSchedules(recordType, record) }) }] };

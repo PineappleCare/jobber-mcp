@@ -29,6 +29,12 @@ Foundation reads are `search_records`, `get_record`, `catalog_search`, and
 `team_list`. They cover clients, properties, requests, quotes, jobs, invoices,
 visits, products/services, and assignable users.
 
+`list_notes` returns paginated, versioned notes for clients, requests, quotes,
+jobs, and invoices. With `records` enabled, `create_note` and `update_note`
+create or edit text, pinned state, and supported record links after approval.
+They do not delete notes or add/remove attachments. Note writes verify ownership,
+version, and readback and never substitute a job or visit instructions field.
+
 With `records` enabled, the server provides client, property, request, draft
 quote, job, and draft-invoice creation/update tools. With `scheduling`, it
 provides visit creation/update/completion and reviewed job close/reopen.

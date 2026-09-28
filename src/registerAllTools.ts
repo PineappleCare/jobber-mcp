@@ -12,6 +12,7 @@ import { registerRequestsInboxTool } from "./tools/requests-inbox.js";
 import { registerGetAuditLogTool } from "./tools/get-audit-log.js";
 import { registerFoundationalTools } from "./tools/foundations.js";
 import { registerJobStatusTool } from "./tools/job-status.js";
+import { registerNoteTools } from "./tools/notes.js";
 import { isReadOnly, isWriteCapabilityEnabled } from "./tool-helpers.js";
 
 /**
@@ -32,5 +33,6 @@ export function registerAllTools(server: McpServer): void {
   registerRequestsInboxTool(server);
   registerGetAuditLogTool(server);
   registerFoundationalTools(server);
+  registerNoteTools(server);
   if (!isReadOnly() && isWriteCapabilityEnabled("scheduling")) registerJobStatusTool(server);
 }

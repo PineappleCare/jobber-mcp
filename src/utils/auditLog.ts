@@ -155,6 +155,7 @@ function redactArgs(args: Record<string, unknown>): Record<string, unknown> {
   for (const [k, v] of Object.entries(args)) {
     if (HASHED_KEYS_NORMALIZED.has(normalizeKey(k))) {
       out[`${k}_hash`] = hashValue(v);
+      if (typeof v === "string") out[`${k}_length`] = v.length;
     } else if (REDACTED_KEYS_NORMALIZED.has(normalizeKey(k))) {
       out[k] = "[REDACTED]";
     } else {

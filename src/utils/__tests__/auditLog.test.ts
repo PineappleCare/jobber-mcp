@@ -213,6 +213,7 @@ describe("appendAuditLog redaction", () => {
     const written = JSON.parse(mockAppendFile.mock.calls[0][1] as string);
     expect(written.args.search_term).toBeUndefined();
     expect(written.args.search_term_hash).toMatch(/^[0-9a-f]{12}$/);
+    expect(written.args.search_term_length).toBe("sarah.miller@gmail.com".length);
   });
 
   it("hashes search_term identically for the same input, so repeated searches can be correlated", async () => {

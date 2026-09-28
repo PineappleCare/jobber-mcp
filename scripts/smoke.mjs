@@ -25,6 +25,7 @@ const EXPECTED_TOOLS = [
   "get_audit_log",
   "search_records",
   "get_record",
+  "list_notes",
   "catalog_search",
   "team_list",
 ];
