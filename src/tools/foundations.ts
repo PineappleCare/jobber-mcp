@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { registerJobLineItemDescriptions } from "./job-line-item-descriptions.js";
 import { createHash } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { appendAuditLog } from "../utils/auditLog.js";
@@ -325,6 +326,7 @@ function registerQuoteJobInvoiceWrites(server: McpServer): void {
     if (args.title && source.property.jobs.nodes.some((job: Node) => normalized(job.title) === normalized(args.title) && !["closed", "archived"].includes(normalized(job.jobStatus)))) throw new Error("A matching active job already exists at this property; no job was created.");
     const data = await run<Node>(`mutation CreateJob($input:JobCreateAttributes!){jobCreate(input:$input){job{${jobFields}} userErrors{message path}}}`, { input: { propertyId: args.property_id, quoteId: args.quote_id, requestId: args.request_id, title: args.title, instructions: args.instructions, lineItems: linesToJob(args.line_items), invoicing: { invoicingType: args.billing_type, invoicingSchedule: args.billing_schedule }, scheduling: { createVisits: false, notifyTeam: false } } }); const job = mutationRecord("creating job", data, "jobCreate", "job"); await audit("create_job", args, job); return response("created", "job", job);
   });
+  registerJobLineItemDescriptions(server);
   registerWriteTool(server, "update_job", { description: "Update title or instructions on a reviewed Jobber job.", capability: "records", inputSchema: { job_id: z.string().min(1), expected_updated_at: z.string().min(1), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
     const current = await run<Node>(`query JobVersion($id:EncodedId!){job(id:$id){updatedAt}}`, { id: args.job_id }); if (current.job?.updatedAt !== args.expected_updated_at) throw new Error("Job changed since it was reviewed; fetch it again before updating."); if (args.title === undefined && args.instructions === undefined) throw new Error("Provide a title or instructions to update."); const data = await run<Node>(`mutation EditJob($jobId:EncodedId!,$input:JobEditInput!){jobEdit(jobId:$jobId,input:$input){job{${jobFields}} userErrors{message path}}}`, { jobId: args.job_id, input: { title: args.title, instructions: args.instructions } }); const job = mutationRecord("updating job", data, "jobEdit", "job"); await audit("update_job", args, job); return response("updated", "job", job);
   });

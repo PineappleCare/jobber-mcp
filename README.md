@@ -40,6 +40,15 @@ the result reports and verifies each visit separately. With
 These record an external send in Jobber; they do not deliver email. Use a
 separate approved mail tool for customer delivery.
 
+`update_job_line_item_descriptions` (records capability) accepts a job ID,
+its reviewed `expected_updated_at`, and up to 20 existing line-item IDs with
+exact replacement descriptions. It checks membership through the job's own
+paginated line-item connection (bounded at 500 lines), checks the version again,
+and sends only IDs and descriptions through `jobEditLineItems`. Readback verifies
+the descriptions and unchanged financial fields. Concurrent changes cannot be
+locked atomically by this API; any partial, changed, or ambiguous result requires
+reconciliation and a new approval. The mutation is never automatically retried.
+
 ## Local development
 
 ```bash
