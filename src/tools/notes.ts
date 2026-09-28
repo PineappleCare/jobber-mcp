@@ -115,15 +115,9 @@ export function recordWithNoteVersions(record: Node): Node {
   };
 }
 
-function normalizeMessage(value: string): string {
-  return value.trim().replace(/\s+/g, " ").toLocaleLowerCase();
-}
-
 function validateLinks(recordType: NoteParentType, links: Record<string, boolean> | undefined): void {
   if (!links) return;
-  const unsupported = Object.entries(links)
-    .filter(([key, enabled]) => enabled && !allowedLinks[recordType].has(key))
-    .map(([key]) => key);
+  const unsupported = Object.keys(links).filter((key) => !allowedLinks[recordType].has(key));
   if (unsupported.length) {
     throw new Error(`${recordType} notes cannot link to: ${unsupported.join(", ")}.`);
   }
@@ -131,7 +125,7 @@ function validateLinks(recordType: NoteParentType, links: Record<string, boolean
 
 function linksForMutation(recordType: NoteParentType, links: Record<string, boolean> | undefined): Record<string, boolean> | undefined {
   if (!links || recordType === "invoice") return undefined;
-  return Object.fromEntries(Object.entries(links).filter(([key]) => allowedLinks[recordType].has(key)));
+  return links;
 }
 
 function requestedLinksMatch(note: Node, requested: Record<string, boolean> | undefined): boolean {
@@ -141,9 +135,11 @@ function requestedLinksMatch(note: Node, requested: Record<string, boolean> | un
 }
 
 function noteMatchesCreate(note: Node, args: Node): boolean {
-  return normalizeMessage(note.message) === normalizeMessage(args.message)
+  const actualLinks = normalizedLinks(note.linkedTo);
+  const requestedLinks = normalizedLinks(args.linked_to);
+  return note.message === args.message
     && note.pinned === args.pinned
-    && requestedLinksMatch(note, args.linked_to);
+    && Object.keys(requestedLinks).every((key) => actualLinks[key] === requestedLinks[key]);
 }
 
 function noteMatchesUpdate(note: Node, args: Node): boolean {
@@ -265,6 +261,7 @@ export function registerNoteTools(server: McpServer): void {
       confirm_write: z.literal(true),
     },
     maxCost: NOTE_COST,
+    redactAuditErrors: true,
   }, async (args: any, run) => {
     validateLinks(args.record_type, args.linked_to);
     const before = await scanNotes(args.record_type, args.record_id, run);
@@ -286,7 +283,7 @@ export function registerNoteTools(server: McpServer): void {
       try {
         after = await scanNotes(args.record_type, args.record_id, run);
       } catch (reconcileError: any) {
-        await auditNote("create_note", args, "error", undefined, error.message);
+        await auditNote("create_note", args, "error", undefined, "Mutation outcome uncertain");
         return result({
           action: "create",
           outcome: "uncertain",
@@ -302,7 +299,7 @@ export function registerNoteTools(server: McpServer): void {
         await auditNote("create_note", args, "success", candidates[0]);
         return result({ action: "created", outcome: "created", verification: "reconciled_after_uncertain_response", record_type: args.record_type, record_id: args.record_id, note: candidates[0] });
       }
-      await auditNote("create_note", args, "error", undefined, error.message);
+      await auditNote("create_note", args, "error", undefined, "Mutation outcome uncertain");
       return result({ action: "create", outcome: "uncertain", record_type: args.record_type, record_id: args.record_id, error: error.message, guidance: "The mutation was not retried. Review this record's notes before requesting another write." }, true);
     }
 
@@ -354,6 +351,7 @@ export function registerNoteTools(server: McpServer): void {
       confirm_write: z.literal(true),
     },
     maxCost: NOTE_COST,
+    redactAuditErrors: true,
   }, async (args: any, run) => {
     if (args.message === undefined && args.pinned === undefined && args.linked_to === undefined) {
       throw new Error("Provide at least one note field to update.");
@@ -382,7 +380,7 @@ export function registerNoteTools(server: McpServer): void {
       try {
         after = await scanNotes(args.record_type, args.record_id, run);
       } catch (reconcileError: any) {
-        await auditNote("update_note", args, "error", undefined, error.message);
+        await auditNote("update_note", args, "error", undefined, "Mutation outcome uncertain");
         return result({
           action: "update",
           outcome: "uncertain",
@@ -399,7 +397,7 @@ export function registerNoteTools(server: McpServer): void {
         await auditNote("update_note", args, "success", reconciled);
         return result({ action: "updated", outcome: "updated", verification: "reconciled_after_uncertain_response", record_type: args.record_type, record_id: args.record_id, note: reconciled });
       }
-      await auditNote("update_note", args, "error", reconciled, error.message);
+      await auditNote("update_note", args, "error", reconciled, "Mutation outcome uncertain");
       return result({ action: "update", outcome: "uncertain", record_type: args.record_type, record_id: args.record_id, ...(reconciled ? { note: reconciled } : {}), error: error.message, guidance: "The mutation was not retried. List the notes again before requesting another update." }, true);
     }
 

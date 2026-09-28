@@ -152,7 +152,7 @@ describe("Jobber notes", () => {
     });
   }
 
-  it("rejects unsupported note links before mutation", async () => {
+  it.each([true, false])("rejects unsupported note links even when set to %s", async (enabled) => {
     const server = fakeServer();
     registerNoteTools(server as any);
 
@@ -161,7 +161,7 @@ describe("Jobber notes", () => {
       record_id: "job-1",
       message: "Do not create",
       pinned: false,
-      linked_to: { requests: true },
+      linked_to: { requests: enabled },
       confirm_write: true,
     });
 
@@ -171,7 +171,7 @@ describe("Jobber notes", () => {
     expect(mockWrite).not.toHaveBeenCalled();
   });
 
-  it("finds an equivalent note beyond the first page and refuses a duplicate", async () => {
+  it("finds an exact equivalent note beyond the first page and refuses a duplicate", async () => {
     mockRead
       .mockResolvedValueOnce(notePage("job", [note({ id: "other", message: "Other" })], true, "next"))
       .mockResolvedValueOnce(notePage("job", [note()], false));
@@ -181,7 +181,7 @@ describe("Jobber notes", () => {
     const response = await server.handlers.create_note({
       record_type: "job",
       record_id: "job-1",
-      message: "  SITE  details from the customer  ",
+      message: "Site details from the customer",
       pinned: false,
       confirm_write: true,
     });
@@ -189,6 +189,84 @@ describe("Jobber notes", () => {
     expect(response.isError).toBe(true);
     expect(response.content[0].text).toContain("equivalent note already exists");
     expect(mockWrite).not.toHaveBeenCalled();
+  });
+
+  it("does not collapse meaningful text differences when checking duplicates", async () => {
+    const existing = note();
+    const created = note({ id: "new-unlinked-note", message: "SITE details\nfrom the customer" });
+    mockRead
+      .mockResolvedValueOnce(notePage("job", [existing]))
+      .mockResolvedValueOnce(notePage("job", [existing, created]));
+    mockWrite.mockResolvedValueOnce({ jobCreateNote: { jobNote: created, userErrors: [] } });
+    const server = fakeServer();
+    registerNoteTools(server as any);
+
+    const response = await server.handlers.create_note({
+      record_type: "job",
+      record_id: "job-1",
+      message: created.message,
+      pinned: false,
+      confirm_write: true,
+    });
+
+    expect(response.isError).not.toBe(true);
+    expect(JSON.parse(response.content[0].text)).toMatchObject({ outcome: "created", note: { id: "new-unlinked-note" } });
+    expect(mockWrite).toHaveBeenCalledTimes(1);
+    expect(mockWrite.mock.calls[0][1].input).not.toHaveProperty("linkedTo");
+  });
+
+  it("does not treat a linked note as a duplicate of an unlinked create", async () => {
+    const existing = note({ linkedTo: { requests: false, quotes: false, jobs: false, invoices: true } });
+    const created = note({ id: "same-text-unlinked" });
+    mockRead
+      .mockResolvedValueOnce(notePage("job", [existing]))
+      .mockResolvedValueOnce(notePage("job", [existing, created]));
+    mockWrite.mockResolvedValueOnce({ jobCreateNote: { jobNote: created, userErrors: [] } });
+    const server = fakeServer();
+    registerNoteTools(server as any);
+
+    const response = await server.handlers.create_note({
+      record_type: "job",
+      record_id: "job-1",
+      message: created.message,
+      pinned: false,
+      confirm_write: true,
+    });
+
+    expect(response.isError).not.toBe(true);
+    expect(mockWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes supported link changes exactly and verifies them", async () => {
+    const before = note();
+    const after = note({
+      linkedTo: { requests: false, quotes: false, jobs: false, invoices: true },
+      lastEditedAt: "2026-09-28T13:00:00Z",
+    });
+    mockRead.mockResolvedValueOnce(notePage("job", [before]));
+    const server = fakeServer();
+    registerNoteTools(server as any);
+    const listed = JSON.parse((await server.handlers.list_notes({
+      record_type: "job", record_id: "job-1", page_size: 20,
+    })).content[0].text);
+    mockRead.mockResolvedValueOnce(notePage("job", [before])).mockResolvedValueOnce(notePage("job", [after]));
+    mockWrite.mockResolvedValueOnce({ jobEditNote: { jobNote: after, userErrors: [] } });
+
+    const response = await server.handlers.update_note({
+      record_type: "job",
+      record_id: "job-1",
+      note_id: "note-1",
+      expected_note_version: listed.notes[0].note_version,
+      linked_to: { invoices: true },
+      confirm_write: true,
+    });
+
+    expect(response.isError).not.toBe(true);
+    expect(mockWrite.mock.calls[0][1].input.linkedTo).toEqual({ invoices: true });
+    expect(JSON.parse(response.content[0].text)).toMatchObject({
+      outcome: "updated",
+      note: { linkedTo: { invoices: true } },
+    });
   });
 
   it("updates a reviewed note and verifies the readback", async () => {
@@ -328,6 +406,27 @@ describe("Jobber notes", () => {
     expect(response.isError).toBe(true);
     expect(JSON.parse(response.content[0].text)).toMatchObject({ outcome: "error", error_type: "jobber_rejected" });
     expect(response.content[0].text).toContain("Notes are unavailable");
+  });
+
+  it("does not persist upstream error details that could echo note text", async () => {
+    const secretMessage = "Customer-private note body";
+    mockRead.mockRejectedValueOnce(new Error(`Jobber rejected ${secretMessage}`));
+    const server = fakeServer();
+    registerNoteTools(server as any);
+
+    const response = await server.handlers.create_note({
+      record_type: "job",
+      record_id: "job-1",
+      message: secretMessage,
+      pinned: false,
+      confirm_write: true,
+    });
+
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain(secretMessage);
+    const auditEntry = mockAudit.mock.calls.at(-1)?.[0];
+    expect(auditEntry.error_message).toBe("Error: details omitted for sensitive input");
+    expect(auditEntry.error_message).not.toContain(secretMessage);
   });
 
   it("preserves the exact approved note text instead of trimming it", async () => {

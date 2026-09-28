@@ -63,6 +63,8 @@ interface ToolConfig<Args, Cost extends number | Record<string, number> = number
   description: string;
   inputSchema?: Args;
   annotations?: Record<string, boolean>;
+  /** Persist only the error class for tools whose upstream errors could echo sensitive input. */
+  redactAuditErrors?: boolean;
   /**
    * The tool's declared cost ceiling(s) - a single number for a tool with one query path, or a
    * named record (e.g. `{ main: 50, paymentsPage: 20 }`) for a tool whose handler makes more than
@@ -160,6 +162,11 @@ function toolErrorPayload(error: unknown): string {
   return JSON.stringify({ outcome: "error", error_type: errorType, error: err.message });
 }
 
+function auditErrorMessage(error: unknown, redact: boolean | undefined): string {
+  const err = error instanceof Error ? error : new Error(String(error));
+  return redact ? `${err.name || "Error"}: details omitted for sensitive input` : err.message;
+}
+
 /**
  * Write tools often perform read-only preflight and verification queries. Only
  * actual GraphQL mutations use the no-retry executor; queries keep the normal
@@ -215,7 +222,12 @@ function registerTool<
         const result = await handler(args ?? {}, runQuery);
         return result;
       } catch (err: any) {
-        await appendAuditLog({ tool: name, args: args ?? {}, outcome: "error", error_message: err.message });
+        await appendAuditLog({
+          tool: name,
+          args: args ?? {},
+          outcome: "error",
+          error_message: auditErrorMessage(err, config.redactAuditErrors),
+        });
         return {
           content: [{ type: "text", text: toolErrorPayload(err) }],
           isError: true,
