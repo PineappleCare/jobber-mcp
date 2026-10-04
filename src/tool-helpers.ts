@@ -150,16 +150,20 @@ function auditValidationFailures<T extends z.ZodTypeAny>(schema: T, toolName: st
   }) as T;
 }
 
-function toolErrorPayload(error: unknown): string {
+export function toolErrorType(error: unknown): string {
   const err = error instanceof Error ? error : new Error(String(error));
-  const errorType = err.name === "JobberOutcomeUncertainError"
+  return err.name === "JobberOutcomeUncertainError"
     ? "outcome_uncertain"
     : ["JobberRejectedError", "JobberPermissionError", "JobberGraphQLRequestError"].includes(err.name)
       ? "jobber_rejected"
       : ["JobberApiError", "JobberAuthenticationError", "BudgetUnavailableError", "RequestRateLimitError"].includes(err.name)
         ? "connection_unavailable"
         : "invalid_request";
-  return JSON.stringify({ outcome: "error", error_type: errorType, error: err.message });
+}
+
+function toolErrorPayload(error: unknown): string {
+  const err = error instanceof Error ? error : new Error(String(error));
+  return JSON.stringify({ outcome: "error", error_type: toolErrorType(err), error: err.message });
 }
 
 function auditErrorMessage(error: unknown, redact: boolean | undefined): string {

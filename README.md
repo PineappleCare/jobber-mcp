@@ -49,10 +49,22 @@ separate approved mail tool for customer delivery.
 `create_draft_invoice` accepts signed, nonzero quantities and nonnegative unit
 prices. A separate named discount uses quantity `-1` and unit price `150` to
 deduct $150; never net that discount into a charge or its description. Present
-all lines and taxability for approval. Quote and job creation still require
+all lines and taxability for approval. `subject` is required for the bounded
+duplicate scan (up to 500 client invoices); an incomplete scan blocks creation.
+`tax_mode` defaults to `hst_13`: resolve an account-owned flat 13% HST rate and
+make omitted line taxability explicitly true, including negative discounts.
+Include `tax_mode` in the approval request. Only an explicit operator request
+uses `tax_mode: none`, which makes omitted taxability false and requires every
+line to be non-taxable. Prefer a 0% account rate when available; otherwise retain
+a verified flat account rate with zero taxable lines. `tax_rate_id` may
+disambiguate existing rates, but cannot select an incompatible rate. Missing or
+ambiguous rates block creation; no tax settings are changed. Quote and job creation still require
 positive quantities. The invoice stays unsent, and creation does not collect a
 payment. A fresh invoice read verifies signed quantities, prices, line totals,
-descriptions, specified taxability/product links, destination and draft status.
+descriptions, taxability/product links, destination, draft status and the exact
+due-date instant (equivalent timestamp offsets are accepted). It also verifies
+the rate, exclusive tax calculation, subtotal, tax, total, balance and absence
+of unrequested invoice-level discounts, deposits, payments and tips.
 Only `outcome: created` confirms successful verified creation. Other outcomes
 retain any returned invoice ID and require reconciliation before a newly
 approved write; creation is never retried automatically. The existing guard
