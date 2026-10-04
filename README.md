@@ -46,6 +46,18 @@ the result reports and verifies each visit separately. With
 These record an external send in Jobber; they do not deliver email. Use a
 separate approved mail tool for customer delivery.
 
+`create_draft_invoice` accepts signed, nonzero quantities and nonnegative unit
+prices. A separate named discount uses quantity `-1` and unit price `150` to
+deduct $150; never net that discount into a charge or its description. Present
+all lines and taxability for approval. Quote and job creation still require
+positive quantities. The invoice stays unsent, and creation does not collect a
+payment. A fresh invoice read verifies signed quantities, prices, line totals,
+descriptions, specified taxability/product links, destination and draft status.
+Only `outcome: created` confirms successful verified creation. Other outcomes
+retain any returned invoice ID and require reconciliation before a newly
+approved write; creation is never retried automatically. The existing guard
+against another invoice on the source job remains in place.
+
 `update_job_line_item_descriptions` (records capability) accepts a job ID,
 its reviewed `expected_updated_at`, and up to 20 existing line-item IDs with
 exact replacement descriptions. It checks membership through the job's own

@@ -30,6 +30,12 @@ const lineItemSchema = z.object({
   taxable: z.boolean().optional(),
   product_or_service_id: z.string().trim().min(1).optional(),
 });
+// Jobber can represent discount lines as signed quantities with a nonnegative price.
+// Keep this contract specific to invoices; other creation tools retain their bounds.
+const invoiceLineItemSchema = lineItemSchema.extend({
+  quantity: z.number().finite().min(-100000).max(100000).refine(value => value !== 0, "Quantity must not be zero").default(1)
+    .describe("Positive quantity for charges; negative quantity for a separate discount, e.g. -1 at unit_price 150 deducts 150"),
+});
 const confirmSchema = z.literal(true).describe("Must be true after reviewing the proposed external change");
 
 type Node = Record<string, any>;
@@ -71,8 +77,33 @@ function linesToQuote(lines: z.infer<typeof lineItemSchema>[]) {
 function linesToJob(lines: z.infer<typeof lineItemSchema>[]) {
   return lines.map((line) => ({ name: line.name, description: line.description, quantity: line.quantity, unitPrice: line.unit_price, taxable: line.taxable, productOrServiceId: line.product_or_service_id, saveToProductsAndServices: false }));
 }
-function linesToInvoice(lines: z.infer<typeof lineItemSchema>[]) {
+function linesToInvoice(lines: z.infer<typeof invoiceLineItemSchema>[]) {
   return lines.map((line) => ({ name: line.name, description: line.description, quantity: line.quantity, unitPrice: line.unit_price, taxable: line.taxable, productOrServiceId: line.product_or_service_id }));
+}
+
+/** Match a multiset, rather than array positions: Jobber may reorder lines. */
+function verifyInvoiceLines(expected: z.infer<typeof invoiceLineItemSchema>[], invoice: Node) {
+  const connection = invoice.lineItems;
+  const complete = Array.isArray(connection?.nodes) && connection.pageInfo?.hasNextPage === false &&
+    new Set(connection.nodes.map((line: Node) => line?.id)).size === connection.nodes.length;
+  const remaining: Node[] = Array.isArray(connection?.nodes) ? [...connection.nodes] : [];
+  const results = expected.map((line, index) => {
+    const matchIndex = remaining.findIndex(saved =>
+      saved && typeof saved.id === "string" && !!saved.id && saved.name === line.name &&
+      (saved.description ?? "") === (line.description ?? "") &&
+      saved.quantity === line.quantity && saved.unitPrice === line.unit_price &&
+      typeof saved.totalPrice === "number" && Number.isFinite(saved.totalPrice) &&
+      Math.abs(saved.totalPrice - line.quantity * line.unit_price) <= 0.0050001 &&
+      (line.taxable === undefined || saved.taxable === line.taxable) &&
+      (line.product_or_service_id === undefined || saved.linkedProductOrService?.id === line.product_or_service_id)
+    );
+    const saved = matchIndex < 0 ? undefined : remaining.splice(matchIndex, 1)[0];
+    return { index, verification: saved ? "verified" : "mismatch", ...(saved ? { line_item_id: saved.id, quantity: saved.quantity, unit_price: saved.unitPrice, total_price: saved.totalPrice } : {}) };
+  });
+  return {
+    verified: complete && remaining.length === 0 && results.every(result => result.verification === "verified"),
+    complete, unexpected_line_count: remaining.length, results,
+  };
 }
 function normalized(value: unknown): string {
   return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
@@ -331,7 +362,17 @@ function registerQuoteJobInvoiceWrites(server: McpServer): void {
   registerWriteTool(server, "update_job", { description: "Update title or instructions on a reviewed Jobber job.", capability: "records", inputSchema: { job_id: z.string().min(1), expected_updated_at: z.string().min(1), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
     const current = await run<Node>(`query JobVersion($id:EncodedId!){job(id:$id){updatedAt}}`, { id: args.job_id }); if (current.job?.updatedAt !== args.expected_updated_at) throw new Error("Job changed since it was reviewed; fetch it again before updating."); if (args.title === undefined && args.instructions === undefined) throw new Error("Provide a title or instructions to update."); const data = await run<Node>(`mutation EditJob($jobId:EncodedId!,$input:JobEditInput!){jobEdit(jobId:$jobId,input:$input){job{${jobFields}} userErrors{message path}}}`, { jobId: args.job_id, input: { title: args.title, instructions: args.instructions } }); const job = mutationRecord("updating job", data, "jobEdit", "job"); await audit("update_job", args, job); return response("updated", "job", job);
   });
-  registerWriteTool(server, "create_draft_invoice", { description: "Create an unsent Jobber invoice with explicit line items. Payments are never created or captured.", capability: "records", inputSchema: { client_id: z.string().min(1), property_id: z.string().min(1).optional(), job_id: z.string().min(1).optional(), subject: z.string().trim().max(250).optional(), message: z.string().trim().max(10000).optional(), due_date: z.string().datetime(), line_items: z.array(lineItemSchema).min(1).max(100), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
+  registerWriteTool(server, "create_draft_invoice", {
+    description: "Create and read back an unsent Jobber invoice with explicit line items. Use a negative quantity and nonnegative unit_price for a separate named discount (quantity -1, unit_price 150 deducts 150). Review every line and taxability. An existing invoice on the source job still requires manual reconciliation. Payments are never created or captured. Partial or uncertain results must be reconciled, never automatically retried.",
+    capability: "records",
+    redactAuditErrors: true,
+    inputSchema: {
+      client_id: z.string().min(1), property_id: z.string().min(1).optional(), job_id: z.string().min(1).optional(),
+      subject: z.string().trim().max(250).optional(), message: z.string().trim().max(10000).optional(),
+      due_date: z.string().datetime(), line_items: z.array(invoiceLineItemSchema).min(1).max(100), confirm_write: confirmSchema,
+    },
+    maxCost: READ_COST,
+  }, async (args, run) => {
     if (args.property_id && args.job_id) throw new Error("A Jobber invoice can be sourced from a property or a job, not both.");
     const source = await run<Node>(`query InvoicePreflight($clientId:EncodedId!){client(id:$clientId){id properties{id} invoices(first:50){nodes{id subject invoiceStatus}}}}`, { clientId: args.client_id });
     assertRelationship(source.client, "Client not found; no invoice was created.");
@@ -342,7 +383,58 @@ function registerQuoteJobInvoiceWrites(server: McpServer): void {
       assertRelationship(jobSource.job.invoices.nodes.length === 0, "The source job already has an invoice; no duplicate invoice was created.");
     }
     if (args.subject && source.client.invoices.nodes.some((invoice: Node) => normalized(invoice.subject) === normalized(args.subject) && normalized(invoice.invoiceStatus) === "draft")) throw new Error("A matching draft invoice already exists; no invoice was created.");
-    const data = await run<Node>(`mutation CreateInvoice($input:InvoiceCreateInput!){invoiceCreate(input:$input){invoice{${invoiceFields}} userErrors{message path}}}`, { input: { clientId: args.client_id, propertyId: args.property_id, jobId: args.job_id, subject: args.subject, message: args.message, dueDetails: { dueDate: args.due_date }, tax: { taxCalculationMethod: "EXCLUSIVE" }, lineItems: linesToInvoice(args.line_items), markSent: false } }); const invoice = mutationRecord("creating draft invoice", data, "invoiceCreate", "invoice"); await audit("create_draft_invoice", args, invoice); return response("created", "invoice", invoice);
+    let invoice: Node | undefined;
+    let mutationError: string | undefined;
+    let userErrors: unknown[] = [];
+    try {
+      const data = await run<Node>(`mutation CreateInvoice($input:InvoiceCreateInput!){invoiceCreate(input:$input){invoice{${invoiceFields}} userErrors{message path}}}`, {
+        input: { clientId: args.client_id, propertyId: args.property_id, jobId: args.job_id, subject: args.subject, message: args.message, dueDetails: { dueDate: args.due_date }, tax: { taxCalculationMethod: "EXCLUSIVE" }, lineItems: linesToInvoice(args.line_items), markSent: false },
+      });
+      const payload = data.invoiceCreate;
+      // Keep the returned ID even if Jobber reports errors alongside it.
+      invoice = payload?.invoice;
+      if (!payload || !Array.isArray(payload.userErrors)) mutationError = "Jobber returned an incomplete mutation response.";
+      else userErrors = payload.userErrors;
+      if (!invoice?.id && !userErrors.length) mutationError = "Jobber did not return an invoice ID.";
+    } catch (error) {
+      mutationError = error instanceof Error ? error.message : String(error);
+    }
+    let observed: Node | undefined;
+    let verificationError: string | undefined;
+    if (invoice?.id) {
+      try {
+        const data = await run<Node>(`query VerifyCreatedInvoice($id:EncodedId!){invoice(id:$id){${invoiceFields} message jobs(first:2){nodes{id} pageInfo{hasNextPage}} properties(first:2){nodes{id} pageInfo{hasNextPage}} lineItems(first:100){nodes{id name description quantity unitPrice totalPrice taxable linkedProductOrService{id}} pageInfo{hasNextPage}}}}`, { id: invoice.id });
+        if (data.invoice?.id !== invoice.id) throw new Error("Created invoice could not be read back.");
+        observed = data.invoice;
+      } catch (error) {
+        verificationError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    const lines = observed ? verifyInvoiceLines(args.line_items, observed) : undefined;
+    const destinationVerified = !!observed && observed.client?.id === args.client_id &&
+      observed.jobs?.pageInfo?.hasNextPage === false && Array.isArray(observed.jobs?.nodes) &&
+      (args.job_id ? observed.jobs.nodes.length === 1 && observed.jobs.nodes[0]?.id === args.job_id : observed.jobs.nodes.length === 0) &&
+      (!args.property_id || (observed.properties?.pageInfo?.hasNextPage === false && observed.properties.nodes?.length === 1 && observed.properties.nodes[0]?.id === args.property_id));
+    const headerVerified = !!observed && observed.invoiceStatus === "draft" &&
+      (args.subject === undefined || observed.subject === args.subject) &&
+      (args.message === undefined || observed.message === args.message);
+    const verified = !!lines?.verified && destinationVerified && headerVerified;
+    const successful = verified && !mutationError && !userErrors.length;
+    const outcome = successful ? "created" : !invoice?.id && !mutationError && userErrors.length ? "rejected" : "partial_or_uncertain";
+    await appendAuditLog({ tool: "create_draft_invoice", args: {
+      ...args, invoice_id: invoice?.id,
+    }, outcome: successful ? "success" : "error", ...(successful ? {} : { error_message: "Invoice creation requires reconciliation; no mutation retry performed." }) });
+    const record = observed ?? invoice;
+    return { content: [{ type: "text" as const, text: JSON.stringify({
+      action: successful ? "created" : "create_invoice", record_type: "invoice", outcome, verification: verified ? "verified" : "unverified",
+      ...(record ? { record, record_version: record.updatedAt } : {}),
+      ...(invoice?.id ? { invoice_id: invoice.id } : {}),
+      destination_verified: destinationVerified, header_verified: headerVerified,
+      ...(lines ? { line_items_complete: lines.complete, unexpected_line_count: lines.unexpected_line_count, results: lines.results } : {}),
+      ...(mutationError ? { mutation_error: mutationError } : {}), ...(userErrors.length ? { user_errors: userErrors } : {}),
+      ...(verificationError ? { verification_error: verificationError } : {}),
+      ...(!successful ? { guidance: "The mutation was not retried. Read the returned invoice ID, or search this client's invoices if no ID was returned, and reconcile before proposing a newly approved write." } : {}),
+    }) }], ...(!successful ? { isError: true } : {}) };
   });
   registerWriteTool(server, "update_draft_invoice", { description: "Update header fields on a reviewed unsent invoice. Jobber does not expose invoice line-item editing in this API version.", capability: "records", inputSchema: { invoice_id: z.string().min(1), expected_updated_at: z.string().min(1), subject: z.string().trim().max(250).optional(), message: z.string().trim().max(10000).optional(), due_date: z.string().datetime().optional(), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
     const current = await run<Node>(`query InvoiceVersion($id:EncodedId!){invoice(id:$id){updatedAt invoiceStatus}}`, { id: args.invoice_id }); if (current.invoice?.updatedAt !== args.expected_updated_at) throw new Error("Invoice changed since it was reviewed; fetch it again before updating."); if (String(current.invoice.invoiceStatus).toLowerCase() !== "draft") throw new Error("Only draft invoices can be edited by this tool."); if (args.subject === undefined && args.message === undefined && args.due_date === undefined) throw new Error("Provide at least one invoice field to update."); const data = await run<Node>(`mutation EditInvoice($invoiceId:EncodedId!,$input:InvoiceEditInput!){invoiceEdit(invoiceId:$invoiceId,input:$input){invoice{${invoiceFields}} userErrors{message path}}}`, { invoiceId: args.invoice_id, input: { subject: args.subject, message: args.message, ...(args.due_date ? { dueDetails: { dueDate: args.due_date } } : {}) } }); const invoice = mutationRecord("updating draft invoice", data, "invoiceEdit", "invoice"); await audit("update_draft_invoice", args, invoice); return response("updated", "invoice", invoice);
