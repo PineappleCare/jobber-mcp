@@ -97,21 +97,16 @@ describe("Tier 1 - ENCRYPTION_KEY env var", () => {
     expect(key.length).toBe(32);
   });
 
-  it("migrates env key to keychain when keychain entry is empty", async () => {
+  it("never copies a vault-supplied env key to the keychain", async () => {
     process.env.ENCRYPTION_KEY = VALID_KEY_HEX;
-    mockGetPassword.mockReturnValue(null);
-    await getEncryptionKey();
-    expect(mockSetPassword).toHaveBeenCalledWith(VALID_KEY_HEX);
+    expect(await getEncryptionKey()).toEqual(Buffer.from(VALID_KEY_HEX,"hex"));
+    expect(MockEntry).not.toHaveBeenCalled();
   });
 
-  it("logs and continues when keychain write fails during migration", async () => {
-    process.env.ENCRYPTION_KEY = VALID_KEY_HEX;
-    mockGetPassword.mockReturnValue(null);
-    mockSetPassword.mockImplementationOnce(() => { throw new Error("keychain locked"); });
-    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const key = await getEncryptionKey();
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Keychain write skipped"));
-    expect(key).toEqual(Buffer.from(VALID_KEY_HEX, "hex"));
+  it("requires a managed key instead of generating one in the keychain or state directory", async () => {
+    process.env.JOBBER_STATE_DIR = "/opt/data/jobber-state";
+    await expect(getEncryptionKey()).rejects.toThrow("vault-supplied ENCRYPTION_KEY");
+    expect(MockEntry).not.toHaveBeenCalled(); expect(mockWriteFile).not.toHaveBeenCalled();
   });
 });
 
@@ -206,6 +201,7 @@ describe("saveTokens / loadTokens / clearTokens", () => {
 
   it("uses JOBBER_STATE_DIR for container-persistent state", async () => {
     process.env.JOBBER_STATE_DIR = "/opt/data/jobber-state";
+    process.env.ENCRYPTION_KEY = VALID_KEY_HEX;
     await saveTokens(tokens);
     expect(mockMkdir).toHaveBeenCalledWith("/opt/data/jobber-state", { recursive: true, mode: 0o700 });
     expect(mockWriteFile.mock.calls[0][0]).toMatch(/^\/opt\/data\/jobber-state\/tokens\.enc\.tmp-/);

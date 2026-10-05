@@ -1,5 +1,8 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
+import { jobberGraphQL, jobberGraphQLWrite } from "../jobber/client.js";
+import { registerVoiceRoutes } from "../voice/http.js";
+import { VoiceService } from "../voice/service.js";
 import { setCookie, getCookie, deleteCookie } from "hono/cookie";
 import { readFileSync } from "fs";
 import { randomUUID, timingSafeEqual, createHash } from "crypto";
@@ -173,6 +176,20 @@ function requireApiKey(req: Request): Response | null {
 }
 
 export const app = new Hono();
+
+// Optional private service surface. Staff MCP registration/approval is unchanged.
+if (process.env.JOBBER_VOICE_ENABLED === "true") {
+  const key = process.env.JOBBER_VOICE_API_KEY || "";
+  const account = process.env.JOBBER_VOICE_ACCOUNT_ID || "";
+  if (key.length < 32 || key === process.env.MCP_API_KEY || !account || !process.env.JOBBER_STATE_DIR) throw new Error("Voice API requires separate credential, account and persistent state");
+  const { VoiceJournal } = await import("../voice/journal.js");
+  const record = { tokens: null, accountId: undefined, refreshInFlight: null } as SessionRecord;
+  const context = buildSessionContext(record, "voice-service");
+  const service = new VoiceService(new VoiceJournal(`${process.env.JOBBER_STATE_DIR}/voice-operations.db`),
+    (query, variables, maxCost = 1000) => sessionStorage.run(context, () =>
+      query.trim().startsWith("mutation") ? jobberGraphQLWrite(query, variables, maxCost) : jobberGraphQL(query, variables, maxCost)), account);
+  registerVoiceRoutes(app, service, key);
+}
 
 app.get("/health", (c) => c.json({ ok: true }));
 

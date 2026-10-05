@@ -91,7 +91,8 @@ Set `JOBBER_CLIENT_ID` and `JOBBER_CLIENT_SECRET`, then ask the MCP host to run
 `authenticate`. OAuth tokens are AES-256-GCM encrypted under
 `JOBBER_STATE_DIR`, or `~/.jobber-mcp/` when that variable is unset. Container
 deployments must mount `JOBBER_STATE_DIR` on persistent storage and provide a
-stable `ENCRYPTION_KEY`. OAuth tokens and the audit log both live under that
+stable vault-supplied `ENCRYPTION_KEY`. Managed state fails closed without it;
+keys supplied through the environment are never copied into OS Keychain. OAuth tokens and the audit log both live under that
 directory. Never commit tokens, client secrets, or an `.env` file.
 
 The included container image runs the authenticated streamable-HTTP transport.
@@ -119,3 +120,41 @@ npm run verify:no-secrets
 This repository is GitHub-source-only today. It deliberately has no MCP
 registry `server.json` entry until the `@pineapplecare/jobber-mcp` package is
 actually published.
+
+## Private Williams voice API
+
+The optional HTTP surface is separate from staff MCP tools and approvals. Enable
+with `JOBBER_VOICE_ENABLED=true`, `JOBBER_VOICE_API_KEY` (at least 32 characters,
+different from `MCP_API_KEY`), `JOBBER_VOICE_ACCOUNT_ID`, `JOBBER_STATE_DIR` and
+vault-supplied `ENCRYPTION_KEY`. Requires Node 22.13 or newer (`node:sqlite`);
+the pinned container runtime supports it. Keep the port on loopback/Tailscale,
+never a public ingress. The voice credential cannot authenticate MCP requests.
+
+`POST /voice/v1/execute` accepts these fixed actions with `call_id` and original
+`caller_number`: `resolve`, `status`, `prepare`, `submit`, `message`, and
+`operation_status`. Ermine supplies identity from signed active inbound call state;
+this is a trusted service interface, not a browser/customer endpoint. The
+connector verifies the configured account before any action, and again before
+external mutations. It never accepts arbitrary GraphQL or a tenant selector.
+See [the Ermine release contract](https://github.com/PineappleCare/ermine/blob/master/docs/WILLIAMS_JOBBER_VOICE.md)
+for the intake shape, deployment order and acceptance procedure.
+
+`submit`/`message` require caller confirmation and a UUID `operation_id`. Bind the
+ID to the full immutable payload and call. The SQLite journal in
+`JOBBER_STATE_DIR/voice-operations.db` records dispatch before every mutation,
+returned IDs and verified readbacks. Retries return the recorded result. Uncertain
+writes are reconciled through reads; verified steps may resume undispatched work.
+Missing evidence remains uncertain for staff review, with no blind mutation replay.
+This is not an exactly-once claim across network or process failures.
+
+New work creates a Request and intake Note, then an Assessment only with a known
+property. Assessments have no start/end time, assigned users or team notification.
+Scheduling preferences remain in the Note. No Jobs, Visits, appointments, prices,
+status changes or customer notifications are created by this surface. Optional
+email, single names and incomplete locations are preserved without invented fields.
+
+`GET /voice/v1/health` requires the voice bearer and returns only aggregate
+operation outcome counts. `scripts/voice-fixture.mjs` is a loopback-only fake
+Jobber backend for Ermine's opt-in cross-repository test; it isolates all audit and
+OAuth state from the developer's home directory and Keychain. Mock verification
+and schema validation do not replace testing scopes and writes on a Jobber test account.

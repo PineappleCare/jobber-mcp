@@ -40,16 +40,12 @@ export async function getEncryptionKey(): Promise<Buffer> {
       throw new Error(
         `ENCRYPTION_KEY must be 64 hex chars (32 bytes for AES-256). Got ${envKey.length} chars.`
       );
-    try {
-      const entry = new Entry(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
-      if (!entry.getPassword()) {
-        entry.setPassword(envKey);
-        console.error("[tokenStorage] Migrated ENCRYPTION_KEY from env to OS keychain. You may remove it from .env.");
-      }
-    } catch (keychainErr: any) {
-      console.error(`[tokenStorage] Keychain write skipped (${keychainErr.message}).`);
-    }
+    // Vault-supplied keys stay in managed configuration; never copy them to a desktop keychain.
     return Buffer.from(envKey, "hex");
+  }
+
+  if ((process.env.JOBBER_STATE_DIR ?? "").trim()) {
+    throw new Error("Managed JOBBER_STATE_DIR requires a vault-supplied ENCRYPTION_KEY; keychain and generated-key fallback are disabled.");
   }
 
   // 2. OS keychain (macOS / Windows Credential Manager / desktop Linux)
