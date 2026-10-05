@@ -157,7 +157,15 @@ export class VoiceService {
       let result: VoiceResult;
       try { result = this.journal.get(input.operation_id, input.call_id); } catch { return { outcome: "not_found", operation_id: input.operation_id }; }
       if (result.outcome === "pending" && !this.running.has(input.operation_id)) return this.execute(this.journal.input(input.operation_id,input.call_id));
-      if (result.outcome === "uncertain") return this.reconcile(voiceInput.parse(this.journal.input(input.operation_id,input.call_id)),result);
+      if (result.outcome === "uncertain" && !this.running.has(input.operation_id)) {
+        // Recovery shares the submission gate. A second poll returns the current
+        // journal snapshot rather than writing a stale result over this recovery.
+        const original = voiceInput.parse(this.journal.input(input.operation_id,input.call_id));
+        this.running.add(input.operation_id);
+        try { result = await this.reconcile(original,result); }
+        finally { this.running.delete(input.operation_id); }
+        if (result.outcome === "pending") return this.execute(original);
+      }
       return result;
     }
     if (input.action === "resolve") {
@@ -194,14 +202,20 @@ export class VoiceService {
     } catch (error) {
       saved.outcome = error instanceof Uncertain ? "uncertain" : Object.keys(saved.records).length ? "partial" : "failed";
       saved.reason = error instanceof Uncertain ? "Write requires reconciliation; no automatic retry." : "Staff review required; no further writes were dispatched.";
-    } finally { this.running.delete(input.operation_id); this.journal.save(input.operation_id, saved); release(); }
+    } finally {
+      try { this.journal.save(input.operation_id, saved); }
+      finally { this.running.delete(input.operation_id); release(); }
+    }
     await appendAuditLog({ account_id: this.accountId, tool: `voice_${input.action}`, args: { operation_id: input.operation_id, call_id: input.call_id }, outcome: saved.outcome === "completed" ? "success" : "error" });
     return saved;
   }
   private async write(input: VoiceInput, result: VoiceResult, step: string, query: string, variables: Record<string, unknown>, payload: string, field: string, verify: (record: any) => Promise<any>): Promise<any> {
     const id = input.operation_id!;
     const old = this.journal.step(id, step);
-    if (old?.state === "verified") return old.record;
+    if (old?.state === "verified") {
+      result.records[step] = ref(old.record);
+      return old.record;
+    }
     let record = old?.record;
     if (old?.state === "dispatched") throw new Uncertain();
     if (!old) {
@@ -268,6 +282,13 @@ export class VoiceService {
           this.journal.verified(id,"assessment",a); result.records.assessment={...ref(a),url:url(request)};
         }
       }
+      // The step journal is authoritative, including after a crash between
+      // verifying a step and saving its public result.
+      for (const step of ["client","property","request","note","assessment"]) {
+        const verified = this.journal.step(id,step);
+        if (verified?.state === "verified" && verified.record?.id) result.records[step] = ref(verified.record);
+      }
+      if (result.records.assessment && result.records.request?.url) result.records.assessment.url = result.records.request.url;
       const required = input.action === "message" ? ["note"] : ["request","note",...(input.intake?.assessment && result.records.property ? ["assessment"] : [])];
       if (required.every(step=>this.journal.step(id,step)?.state === "verified")) {
         result.outcome="completed"; delete result.reason;
@@ -276,13 +297,12 @@ export class VoiceService {
       this.journal.save(id,result);
       if (result.outcome === "uncertain" && ["client","property","request","note","assessment"].every(step => { const prior=this.journal.step(id,step); return !prior || prior.state === "verified"; })) {
         result.outcome="pending"; this.journal.save(id,result);
-        return this.execute(input);
       }
     } catch { /* Retain uncertainty when reads cannot prove the entire intended result. */ }
     return result;
   }
   private noteText(input: VoiceInput): string {
-    const i = input.intake;
+    const i = input.action === "submit" ? input.intake : undefined;
     const body = i ? Object.entries(i).filter(([k,v]) => v && !["property_id","client_id","assessment"].includes(k)).map(([k,v]) => `${k.replace(/_/g," ")}: ${v}`).join("\n") : input.message!;
     return `Customer phone intake\n${body}\n\nVoice operation: ${input.operation_id}`;
   }

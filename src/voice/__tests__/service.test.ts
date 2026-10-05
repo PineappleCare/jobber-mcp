@@ -178,3 +178,44 @@ it("requires review for duplicate addresses and ambiguous authorized properties"
  const r=await f.service.execute({...input(),caller_number:"+17055550100",intake:{...intake,callback_number:"+17055550100",street1:"1 Main"}});expect(r.outcome).toBe("failed");expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);
  const unmatched=await f.service.execute({...input(),intake:{...intake,street1:"1 Main"}});expect(unmatched.outcome).toBe("failed");expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);
 });
+
+it("confirmed message must survive stale intake arguments", async()=>{
+ const f=fixture();
+ const r=await f.service.execute({...input(),caller_number:"+17055550100",intake:{...intake,street1:"1 Main",callback_number:"+17055550100"}});
+ expect(r.outcome).toBe("completed");
+ const result=await f.service.execute({action:"message",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID(),confirmed:true,record_type:"request",record_id:"r1",message:"The new gate code is 4321",intake});
+ expect(result.outcome).toBe("completed");
+ expect(f.noteRecords[1].message).toContain("The new gate code is 4321");
+ expect(f.noteRecords[1].message).not.toContain("Leaking tap");
+});
+
+it("concurrent reconciliation must preserve every verified outcome", async()=>{
+ const f=fixture(false),original=f.run.getMockImplementation()!,args=input(); let lose=true;
+ f.run.mockImplementation(async(q,v)=>{const r=await original(q,v);if(q.includes("VoiceCreateRequest")&&lose){lose=false;throw Error("lost request response");}return r;});
+ expect((await f.service.execute(args)).outcome).toBe("uncertain");
+ let release!:()=>void,started!:()=>void;
+ const blocked=new Promise<void>(r=>{release=r}), entered=new Promise<void>(r=>{started=r});let first=true;
+ f.run.mockImplementation(async(q,v)=>{if(q.includes("VoiceClientRequests")&&first){first=false;started();await blocked;}return original(q,v);});
+ const status={action:"operation_status",call_id:args.call_id,caller_number:args.caller_number,operation_id:args.operation_id};
+ const slow=f.service.execute(status);await entered;
+ const fast=await f.service.execute(status);
+ expect(fast.outcome).toBe("uncertain");
+ expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceClientRequests"))).toHaveLength(1);
+ release();expect((await slow).outcome).toBe("completed");
+ const persisted=f.journal.get(args.operation_id,args.call_id);
+ expect(persisted.records.assessment?.id).toBe("a1");expect(persisted.records.note?.id).toBe("n1");
+ expect(persisted.records.assessment.url).toBe(persisted.records.request.url);
+ expect(persisted.assessment_mode).toBe("unscheduled");
+ expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCreateRequest"))).toHaveLength(1);
+ expect(f.run.mock.calls.filter(([q])=>q.includes("mutation VoiceRequestNote"))).toHaveLength(1);
+ expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCreateAssessment"))).toHaveLength(1);
+});
+
+it("rebuilds verified IDs and parent links after a public-result save was interrupted",async()=>{
+ const f=fixture(false),args=input(),completed=await f.service.execute(args);
+ f.journal.save(args.operation_id,{...completed,outcome:"uncertain",records:{client:completed.records.client,property:completed.records.property}});
+ const r=await f.service.execute({action:"operation_status",call_id:args.call_id,caller_number:args.caller_number,operation_id:args.operation_id});
+ expect(r.outcome).toBe("completed");expect(r.records.request.id).toBe("r1");expect(r.records.note.id).toBe("n1");expect(r.records.assessment.id).toBe("a1");
+ expect(r.records.assessment.url).toBe(r.records.request.url);expect(r.assessment_mode).toBe("unscheduled");
+ expect(f.run.mock.calls.filter(([q])=>q.startsWith("mutation"))).toHaveLength(5);
+});
