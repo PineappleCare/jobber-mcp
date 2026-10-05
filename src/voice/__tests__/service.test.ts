@@ -219,3 +219,11 @@ it("rebuilds verified IDs and parent links after a public-result save was interr
  expect(r.records.assessment.url).toBe(r.records.request.url);expect(r.assessment_mode).toBe("unscheduled");
  expect(f.run.mock.calls.filter(([q])=>q.startsWith("mutation"))).toHaveLength(5);
 });
+
+it("does not mark a mutation dispatched when budget admission rejects it before network dispatch",async()=>{
+ const {BudgetUnavailableError}=await import("../../jobber/cost-governor.js");
+ const f=fixture(false),args=input(),original=f.run.getMockImplementation()!;let first=true;
+ f.run.mockImplementation(async(q,v)=>{if(q.includes("VoiceCreateClient")&&first){first=false;throw new BudgetUnavailableError(10);}return original(q,v);});
+ expect((await f.service.execute(args)).outcome).toBe("pending");expect(f.journal.step(args.operation_id,"client")).toBeUndefined();
+ expect((await f.service.execute(args)).outcome).toBe("completed");expect(f.cs.length).toBe(1);
+});

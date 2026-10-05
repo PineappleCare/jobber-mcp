@@ -295,7 +295,10 @@ async function executeGraphQL<T = any>(
           // assume the budget is exhausted rather than retrying instantly against it.
           governor.assumeDepleted();
         }
-        await sleep(governor.backoffMsFor(maxCost));
+        const reported = body?.extensions?.cost?.requestedQueryCost;
+        const required = typeof reported === "number" && Number.isFinite(reported) ? Math.max(maxCost, reported) : maxCost;
+        // Re-reserve after refill; underestimated declarations must not cause an immediate retry.
+        await governor.checkBudget(required);
         continue;
       }
 

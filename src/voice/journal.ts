@@ -17,13 +17,38 @@ export class VoiceJournal {
     chmodSync(file, 0o600);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS voice_operations(id TEXT PRIMARY KEY,call_id TEXT NOT NULL,payload_hash TEXT NOT NULL,result TEXT NOT NULL,payload TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS voice_steps(operation_id TEXT NOT NULL,name TEXT NOT NULL,state TEXT NOT NULL,record TEXT,PRIMARY KEY(operation_id,name));`);
+      CREATE TABLE IF NOT EXISTS voice_steps(operation_id TEXT NOT NULL,name TEXT NOT NULL,state TEXT NOT NULL,record TEXT,PRIMARY KEY(operation_id,name));
+ CREATE TABLE IF NOT EXISTS voice_checkpoints(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS voice_directory(account TEXT PRIMARY KEY,generation TEXT NOT NULL,completed INTEGER NOT NULL,failed INTEGER);
+ CREATE TABLE IF NOT EXISTS voice_directory_phones(account TEXT NOT NULL,generation TEXT NOT NULL,phone TEXT NOT NULL,client TEXT NOT NULL,PRIMARY KEY(account,generation,phone,client));`);
   }
   counts(): Record<string, number> {
     const result: Record<string, number> = {};
     for (const row of this.db.prepare("SELECT json_extract(result,'$.outcome') AS outcome,count(*) AS count FROM voice_operations GROUP BY outcome").all() as any[]) result[row.outcome]=row.count;
     return result;
   }
+  pending(): {id:string;call:string}[] {
+    return this.db.prepare("SELECT id,call_id AS call FROM voice_operations WHERE json_extract(result,'$.outcome') IN ('pending','uncertain') AND COALESCE(json_extract(result,'$.retry_at'),0)<=? LIMIT 10").all(Date.now()) as any;
+  }
+  checkpoint(key:string): any { const row=this.db.prepare("SELECT value FROM voice_checkpoints WHERE key=?").get(key) as any; return row ? JSON.parse(row.value):undefined; }
+  setCheckpoint(key:string,value:unknown):void { this.db.prepare("INSERT INTO voice_checkpoints VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key,JSON.stringify(value)); }
+  deleteCheckpoint(key:string):void {this.db.prepare("DELETE FROM voice_checkpoints WHERE key=?").run(key);}
+  directoryStatus(account:string):Record<string,unknown> { const row=this.db.prepare("SELECT completed,failed FROM voice_directory WHERE account=?").get(account) as any; return {complete:!!row,completed_at:row?.completed ?? null,last_failure_at:row?.failed ?? this.checkpoint(`directory-failure:${account}`)?.at ?? null,refresh_in_progress:!!this.checkpoint(`directory:${account}`)}; }
+  directoryCandidates(account:string,phone:string):string[]|undefined {
+    const row=this.db.prepare("SELECT generation FROM voice_directory WHERE account=?").get(account) as any;
+    if(!row)return undefined;
+    return (this.db.prepare("SELECT client FROM voice_directory_phones WHERE account=? AND generation=? AND phone=?").all(account,row.generation,phone) as any[]).map(r=>r.client);
+  }
+  addDirectoryPhone(account:string,generation:string,phone:string,client:string):void {this.db.prepare("INSERT OR IGNORE INTO voice_directory_phones VALUES(?,?,?,?)").run(account,generation,phone,client);}
+  publishDirectory(account:string,generation:string):void {
+ this.deleteCheckpoint(`directory-failure:${account}`);
+    this.db.exec("BEGIN IMMEDIATE");try {
+      this.db.prepare("INSERT INTO voice_directory VALUES(?,?,?,NULL) ON CONFLICT(account) DO UPDATE SET generation=excluded.generation,completed=excluded.completed,failed=NULL").run(account,generation,Date.now());
+      this.db.prepare("DELETE FROM voice_directory_phones WHERE account=? AND generation!=?").run(account,generation);
+      this.db.exec("COMMIT");
+    } catch(e){this.db.exec("ROLLBACK");throw e;}
+  }
+  directoryFailure(account:string):void {this.setCheckpoint(`directory-failure:${account}`,{at:Date.now()});this.db.prepare("UPDATE voice_directory SET failed=? WHERE account=?").run(Date.now(),account);}
   close(): void { this.db.close(); }
   start(id: string, call: string, payload: unknown): VoiceResult {
     const hash = fingerprint(payload);
@@ -56,6 +81,8 @@ export class VoiceJournal {
   dispatched(id: string, name: string): void {
     this.db.prepare("INSERT INTO voice_steps VALUES(?,?,'dispatched',NULL)").run(id, name);
   }
+  notDispatched(id:string,name:string):void {this.db.prepare("DELETE FROM voice_steps WHERE operation_id=? AND name=? AND state='dispatched' AND record IS NULL").run(id,name);}
+  clearScan(id:string):void {this.db.prepare("DELETE FROM voice_checkpoints WHERE key LIKE ?").run(`scan:${id}:%`);}
   returned(id: string, name: string, record: VoiceResult): void {
     this.db.prepare("UPDATE voice_steps SET state='returned',record=? WHERE operation_id=? AND name=?").run(JSON.stringify(record), id, name);
   }

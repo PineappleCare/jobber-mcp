@@ -792,3 +792,12 @@ function costExtRaw(throttleStatus: { maximumAvailable: number; currentlyAvailab
 function costExt(currentlyAvailable: number) {
   return costExtRaw({ maximumAvailable: 10000, currentlyAvailable, restoreRate: 500 });
 }
+
+it("uses reported requested cost when a read declaration underestimates its cost",async()=>{
+ vi.useFakeTimers();mockRequireSessionContext.mockReturnValue(httpCtx(freshSessionId()));
+ const cost={requestedQueryCost:1005,actualQueryCost:0,throttleStatus:{maximumAvailable:10000,currentlyAvailable:950,restoreRate:500}};
+ const fetchMock=vi.fn().mockResolvedValueOnce(jsonResponse(200,{errors:[{message:"Throttled",extensions:{code:"THROTTLED"}}],extensions:{cost}})).mockResolvedValueOnce(jsonResponse(200,{data:{ok:true}}));vi.stubGlobal("fetch",fetchMock);
+ const pending=jobberGraphQL("query { x }",undefined,1000);
+ await vi.advanceTimersByTimeAsync(100);expect(fetchMock).toHaveBeenCalledTimes(1);
+ await vi.advanceTimersByTimeAsync(10);expect(await pending).toEqual({ok:true});expect(fetchMock).toHaveBeenCalledTimes(2);
+});

@@ -189,6 +189,9 @@ if (process.env.JOBBER_VOICE_ENABLED === "true") {
     (query, variables, maxCost = 1000) => sessionStorage.run(context, () =>
       query.trim().startsWith("mutation") ? jobberGraphQLWrite(query, variables, maxCost) : jobberGraphQL(query, variables, maxCost)), account);
   registerVoiceRoutes(app, service, key);
+  setInterval(()=>{void sessionStorage.run(context,()=>service.tick()).catch(()=>{});},1000).unref();
+  const refresh=()=>{void sessionStorage.run(context,()=>service.directory.refresh()).catch(()=>{});};
+  refresh(); setInterval(refresh,5*60*1000).unref();
 }
 
 app.get("/health", (c) => c.json({ ok: true }));

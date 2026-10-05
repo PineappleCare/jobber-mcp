@@ -1,3 +1,9 @@
+import { BudgetUnavailableError, RequestRateLimitError } from "../jobber/cost-governor.js";
+import { JobberPermissionError, JobberAuthenticationError, JobberGraphQLRequestError } from "../jobber/client.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
+import { VoiceDirectory, DirectoryIncomplete } from "./directory.js";
+import { fingerprint } from "./journal.js";
 import { z } from "zod";
 import type { VoiceJournal, VoiceResult } from "./journal.js";
 import { appendAuditLog } from "../utils/auditLog.js";
@@ -29,13 +35,13 @@ export function normalizePhone(value: string): string | null {
 const pageInfo = `pageInfo{hasNextPage endCursor}`;
 const properties = `properties{id name street1 street2 city province postalCode country jobberWebUri}`;
 const clientBasic = `id name firstName lastName companyName jobberWebUri phones{number} emails{address} ${properties}`;
-const clientsQuery = `query VoiceClients($after:String){clients(first:50,after:$after){nodes{${clientBasic}} ${pageInfo}}}`;
+const clientsQuery = `query VoiceClients($after:String){clients(first:10,after:$after){nodes{${clientBasic}} ${pageInfo}}}`;
 const clientQuery = `query VoiceClient($id:EncodedId!){client(id:$id){${clientBasic}}}`;
-const contactsQuery = `query VoiceContacts($id:EncodedId!,$after:String){client(id:$id){contacts(first:1,after:$after){nodes{id properties(first:50){nodes{id} ${pageInfo}} phones(first:50){nodes{number} ${pageInfo}}} ${pageInfo}}}}`;
-const contactQuery = `query VoiceContact($id:EncodedId!,$contactAfter:String,$after:String){client(id:$id){contacts(first:1,after:$contactAfter){nodes{id phones(first:50,after:$after){nodes{number} ${pageInfo}}}}}}`;
-const contactPropertiesQuery = `query VoiceContactProperties($id:EncodedId!,$contactAfter:String,$after:String){client(id:$id){contacts(first:1,after:$contactAfter){nodes{id properties(first:50,after:$after){nodes{id} ${pageInfo}}}}}}`;
-const contactEmailsQuery = `query VoiceContactEmails($id:EncodedId!,$after:String){client(id:$id){contacts(first:1,after:$after){nodes{id name emails(first:50){nodes{address} ${pageInfo}}} ${pageInfo}}}}`;
-const moreContactEmailsQuery = `query VoiceMoreContactEmails($id:EncodedId!,$contactAfter:String,$after:String){client(id:$id){contacts(first:1,after:$contactAfter){nodes{id emails(first:50,after:$after){nodes{address} ${pageInfo}}}}}}`;
+const contactsQuery = `query VoiceContacts($id:EncodedId!,$after:String){client(id:$id){contacts(first:1,after:$after,filter:{includePropertyContacts:true}){nodes{id properties(first:50){nodes{id} ${pageInfo}} phones(first:50){nodes{number} ${pageInfo}}} ${pageInfo}}}}`;
+const contactQuery = `query VoiceContact($id:EncodedId!,$contactAfter:String,$after:String){client(id:$id){contacts(first:1,after:$contactAfter,filter:{includePropertyContacts:true}){nodes{id phones(first:50,after:$after){nodes{number} ${pageInfo}}}}}}`;
+const contactPropertiesQuery = `query VoiceContactProperties($id:EncodedId!,$contactAfter:String,$after:String){client(id:$id){contacts(first:1,after:$contactAfter,filter:{includePropertyContacts:true}){nodes{id properties(first:50,after:$after){nodes{id} ${pageInfo}}}}}}`;
+const contactEmailsQuery = `query VoiceContactEmails($id:EncodedId!,$after:String){client(id:$id){contacts(first:1,after:$after,filter:{includePropertyContacts:true}){nodes{id name emails(first:50){nodes{address} ${pageInfo}}} ${pageInfo}}}}`;
+const moreContactEmailsQuery = `query VoiceMoreContactEmails($id:EncodedId!,$contactAfter:String,$after:String){client(id:$id){contacts(first:1,after:$contactAfter,filter:{includePropertyContacts:true}){nodes{id emails(first:50,after:$after){nodes{address} ${pageInfo}}}}}}`;
 const requestFields = `id title requestStatus jobberWebUri client{id} property{id} assessment{id instructions startAt endAt assignedUsers(first:20){nodes{id} ${pageInfo}}}`;
 const requestQuery = `query VoiceRequest($id:EncodedId!){request(id:$id){${requestFields}}}`;
 const jobFields = `id title jobStatus jobberWebUri client{id} property{id}`;
@@ -53,6 +59,7 @@ const notes = {
   job: { query: `query VoiceJobNotes($id:EncodedId!,$after:String){job(id:$id){notes(first:50,after:$after){nodes{... on NoteInterface{id message}} ${pageInfo}}}}`, mutation: `mutation VoiceJobNote($id:EncodedId!,$input:JobCreateNoteInput!){jobCreateNote(jobId:$id,input:$input){jobNote{id message} userErrors{message path}}}`, payload: "jobCreateNote", field: "jobNote" },
 };
 class Uncertain extends Error {}
+class Permanent extends Error {}
 function knownLocation(i: NonNullable<VoiceInput["intake"]>): boolean { return !!(i.street1 && i.city && /\d/.test(i.street1)); }
 function sameAddress(p: any, i: NonNullable<VoiceInput["intake"]>): boolean { return !!(i.street1 && i.city && p.street1?.trim().toLowerCase() === i.street1.toLowerCase() && (p.street2 || "").trim().toLowerCase() === i.street2.toLowerCase() && p.city?.trim().toLowerCase() === i.city.toLowerCase()); }
 type Match = { client: any; propertyIds: Set<string> | null };
@@ -64,27 +71,94 @@ function ref(record: any): VoiceResult { return { id: record.id, ...(url(record)
 export class VoiceService {
   private running = new Set<string>();
   private writeTail: Promise<void> = Promise.resolve();
-  constructor(private journal: VoiceJournal, private run: RunQuery, private accountId: string) {}
+  private jobs = new Map<string, Promise<VoiceResult>>();
+  private lookupContext = new AsyncLocalStorage<string>();
+  readonly directory: VoiceDirectory;
+  constructor(private journal: VoiceJournal, private run: RunQuery, private accountId: string) { this.directory=new VoiceDirectory(journal,run,accountId); }
+  directoryHealth(): Record<string,unknown> {return this.directory.status();}
+  async tick():Promise<void> { for(const op of this.journal.pending()) this.launch(voiceInput.parse(this.journal.input(op.id,op.call))); }
+  /** Private HTTP dispatch is always quick; the journal owns unfinished work. */
+  async dispatch(raw:unknown):Promise<VoiceResult> {
+    const input=voiceInput.parse(raw);
+    if(input.action==="prepare") return this.execute(input);
+    if(input.action==="operation_status") {
+      if(!input.operation_id)throw new Permanent("operation_id required");
+      let result:VoiceResult;try{result=this.journal.get(input.operation_id,input.call_id);}catch{return {outcome:"not_found",operation_id:input.operation_id};}
+      const original=voiceInput.parse(this.journal.input(input.operation_id,input.call_id));
+      if(result.outcome==="completed" && ["resolve","status"].includes(original.action)) {
+        // A stored read result is not ongoing permission to disclose a customer's records.
+        result={operation_id:input.operation_id,outcome:"pending",records:{}};
+        this.journal.save(input.operation_id,result);
+        const work=this.launch(original);let timer:ReturnType<typeof setTimeout>;
+        try{return await Promise.race([work,new Promise<VoiceResult>(r=>{timer=setTimeout(()=>r(this.journal.get(input.operation_id!,input.call_id)),2000);})]);}finally{clearTimeout(timer!);}
+      }
+      if(["pending","uncertain"].includes(result.outcome) && (!result.retry_at || result.retry_at<=Date.now())) this.launch(voiceInput.parse(this.journal.input(input.operation_id,input.call_id)));
+      return result;
+    }
+    if(!input.operation_id) input.operation_id=randomUUID();
+    const saved=this.journal.start(input.operation_id,input.call_id,input);
+    if(!["pending","uncertain"].includes(saved.outcome))return saved;
+    const work=this.launch(input);
+    let timer:ReturnType<typeof setTimeout>;
+    const timeout=new Promise<VoiceResult>(resolve=>{timer=setTimeout(()=>resolve(this.journal.get(input.operation_id!,input.call_id)),2000);});
+    try{return await Promise.race([work,timeout]);}finally{clearTimeout(timer!);}
+  }
+  private launch(input:VoiceInput):Promise<VoiceResult> {
+    const id=input.operation_id!;
+    const old=this.jobs.get(id);if(old)return old;
+    const task=this.lookupContext.run(id,async()=>{
+      let result:VoiceResult;
+      try {
+        const prior=this.journal.get(id,input.call_id);
+        result=prior.outcome==="uncertain" ? await this.execute({action:"operation_status",operation_id:id,call_id:input.call_id,caller_number:input.caller_number}) : await this.execute(input);
+      }catch(error){
+        const permanent=error instanceof Permanent || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError || error instanceof JobberGraphQLRequestError;
+        result=this.journal.get(id,input.call_id);result.outcome=permanent ? "failed":"pending";
+        result.reason_code=permanent ? "validation_or_authorization":"lookup_unavailable";
+        result.retry_at=Date.now()+15000;
+      }
+      result.operation_id=id; this.journal.save(id,result);if(result.outcome==="completed")this.journal.clearScan(id);return result;
+    }).finally(()=>{this.jobs.delete(id);});
+    this.jobs.set(id,task);return task;
+  }
+  private async scan(query:string,variables:Record<string,unknown>):Promise<any> {
+    const id=this.lookupContext.getStore();const memo=/query Voice(?:Clients|Contacts|ContactEmails)\(/.test(query);const key=id && memo ? `scan:${id}:${fingerprint({query,variables})}`:undefined;
+    const saved=key && this.journal.checkpoint(key);if(saved)return saved;
+    const result=await this.run(query,variables,this.cost(query));
+    if(key) {
+      const c=result.clients || result.client?.contacts;
+      if(!Array.isArray(c?.nodes) || typeof c.pageInfo?.hasNextPage!=="boolean" || c.pageInfo.hasNextPage && (!c.pageInfo.endCursor || c.pageInfo.endCursor===variables.after))throw new DirectoryIncomplete("Incomplete Jobber lookup");
+      this.journal.setCheckpoint(key,result);
+    }
+    return result;
+  }
+  private cost(query:string):number {
+    if(query.includes("VoiceClients("))return 2500;
+    if(query.includes("VoiceClientRequests"))return 2500;
+    if(query.includes("VoiceContacts") || query.includes("VoiceContactEmails"))return 800;
+    if(query.includes("VoiceClient("))return 1500;
+    return 500;
+  }
   health(): Record<string, number> { return this.journal.counts(); }
   private async pages(query: string, variables: Record<string, unknown>, select: (data: any) => any): Promise<any[]> {
     const result: any[] = []; let after: string | undefined;
-    for (let page = 0; page < 200; page++) {
-      const connection = select(await this.run(query, { ...variables, after }, 1000));
+    for (let page = 0; page < (query===clientsQuery ? 10000:200); page++) {
+      const connection = select(await this.scan(query, { ...variables, after }));
       if (!connection || !Array.isArray(connection.nodes) || typeof connection.pageInfo?.hasNextPage !== "boolean") throw new Error("Incomplete Jobber lookup");
       result.push(...connection.nodes);
       if (!connection.pageInfo.hasNextPage) return result;
       if (!connection.pageInfo.endCursor || connection.pageInfo.endCursor === after) throw new Error("Incomplete Jobber lookup");
       after = connection.pageInfo.endCursor;
     }
-    throw new Error("Lookup exceeds bounded scan; staff review required");
+    throw new Permanent("Lookup exceeds bounded scan; staff review required");
   }
   private async clients(): Promise<any[]> { return this.pages(clientsQuery, {}, d => d.clients); }
-  private async match(client: any, number: string): Promise<Match | null> {
+  private async match(client: any, number: string, fresh=false): Promise<Match | null> {
     if (client.phones.some((p: any) => normalizePhone(p.number) === number)) return { client, propertyIds: null };
     const allowed = new Set<string>(); let matched = false, unrestricted = false;
     let after: string | undefined;
     for (let page = 0; page < 200; page++) {
-      const connection = (await this.run(contactsQuery, { id: client.id, after }, 1000)).client?.contacts;
+      const connection = (await (fresh ? this.run(contactsQuery,{id:client.id,after},800):this.scan(contactsQuery, { id: client.id, after }))).client?.contacts;
       if (!connection || !Array.isArray(connection.nodes) || typeof connection.pageInfo?.hasNextPage !== "boolean") throw new Error("Incomplete contact lookup");
       for (const contact of connection.nodes) {
         const variables = { id: client.id, contactAfter: after };
@@ -108,7 +182,7 @@ export class VoiceService {
     let after: string | undefined;
     let duplicate = false;
     for (let page = 0; page < 200; page++) {
-      const connection = (await this.run(contactEmailsQuery, { id: clientId, after }, 1000)).client?.contacts;
+      const connection = (await this.scan(contactEmailsQuery, { id: clientId, after })).client?.contacts;
       if (!connection || !Array.isArray(connection.nodes) || typeof connection.pageInfo?.hasNextPage !== "boolean") throw new Error("Incomplete duplicate lookup");
       for (const contact of connection.nodes) {
         const emails = await this.pages(moreContactEmailsQuery, { id: clientId, contactAfter: after }, d => d.client?.contacts?.nodes.find((c: any) => c.id === contact.id)?.emails);
@@ -123,24 +197,28 @@ export class VoiceService {
   private async matches(number: string | null): Promise<Match[]> {
     if (!number) return [];
     const matches: Match[] = [];
-    for (const c of await this.clients()) { const m = await this.match(c, number); if (m) matches.push(m); }
+    const candidates=this.lookupContext.getStore() ? this.directory.candidates(number):undefined;
+    if(this.lookupContext.getStore() && candidates===undefined) {await this.directory.refresh();}
+    const ids=this.lookupContext.getStore() ? this.directory.candidates(number):undefined;
+    if(ids?.length) {for(const id of ids){const c=(await this.run(clientQuery,{id},1500)).client;if(c){const m=await this.lookupContext.run("",()=>this.match(c,number,true));if(m)matches.push(m);}}}
+    else {for (const c of await this.clients()) { const m = await this.match(c, number); if (m) matches.push(m); }}
     return matches;
   }
   private async fresh(number: string | null, clientId: string): Promise<Match> {
-    if (!number) throw new Error("Caller phone is not matched");
-    const c = (await this.run(clientQuery, { id: clientId }, 1000)).client;
-    const m = c && await this.match(c, number);
-    if (!m) throw new Error("Caller phone is not matched");
+    if (!number) throw new Permanent("Caller phone is not matched");
+    const c = (await this.run(clientQuery, { id: clientId }, 1500)).client;
+    const m = c && await this.lookupContext.run("",()=>this.match(c, number,true));
+    if (!m) throw new Permanent("Caller phone is not matched");
     return m;
   }
   private allowed(m: Match, propertyId?: string): boolean { return !m.propertyIds || (!!propertyId && m.propertyIds.has(propertyId)); }
   private async target(input: VoiceInput): Promise<{ record: any; match: Match }> {
-    if (!input.record_type || !input.record_id) throw new Error("Select an authorized record first");
+    if (!input.record_type || !input.record_id) throw new Permanent("Select an authorized record first");
     const type = input.record_type;
     const record = (await this.run(type === "job" ? jobQuery : type === "request" ? requestQuery : clientQuery, { id: input.record_id }, 1000))[type];
-    if (!record) throw new Error("Record is not accessible");
+    if (!record) throw new Permanent("Record is not accessible");
     const m = await this.fresh(normalizePhone(input.caller_number), type === "client" ? record.id : record.client.id);
-    if (type === "client" && m.propertyIds || type !== "client" && !this.allowed(m, record.property?.id)) throw new Error("Record is not accessible");
+    if (type === "client" && m.propertyIds || type !== "client" && !this.allowed(m, record.property?.id)) throw new Permanent("Record is not accessible");
     return { record, match: m };
   }
   private async publicStatus(type: string, r: any): Promise<VoiceResult> {
@@ -151,7 +229,7 @@ export class VoiceService {
   async execute(raw: unknown): Promise<VoiceResult> {
     const input = voiceInput.parse(raw);
     const account = (await this.run(`query VoiceAccount{account{id}}`, {}, 1)).account;
-    if (!this.accountId || account?.id !== this.accountId) throw new Error("Voice Jobber account mismatch");
+    if (!this.accountId || account?.id !== this.accountId) throw new Permanent("Voice Jobber account mismatch");
     if (input.action === "operation_status") {
       if (!input.operation_id) throw new Error("operation_id is required");
       let result: VoiceResult;
@@ -172,18 +250,21 @@ export class VoiceService {
       const matched = await this.matches(normalizePhone(input.caller_number));
       const records = [];
       for (const m of matched) {
+        await this.fresh(normalizePhone(input.caller_number),m.client.id);
+        const requests=await this.pages(clientRequests,{id:m.client.id},d=>d.client?.requests);
+        const jobs=await this.pages(clientJobs,{id:m.client.id},d=>d.client?.jobs);
         const current = await this.fresh(normalizePhone(input.caller_number), m.client.id);
         records.push({ record_type: "client", ...ref(current.client), name: current.client.name, selectable: !current.propertyIds,
           properties: current.client.properties.filter((p: any) => this.allowed(current, p.id)).map((p: any) => ({ id: p.id, address: [p.street1,p.street2,p.city].filter(Boolean).join(", ") })),
-          requests: (await this.pages(clientRequests, { id: m.client.id }, d => d.client?.requests)).filter(r => this.allowed(current, r.property?.id)).map(r => ({ ...ref(r), title: r.title })),
-          jobs: (await this.pages(clientJobs, { id: m.client.id }, d => d.client?.jobs)).filter(r => this.allowed(current, r.property?.id)).map(r => ({ ...ref(r), title: r.title })) });
+          requests: requests.filter(r => this.allowed(current, r.property?.id)).map(r => ({ ...ref(r), title: r.title })),
+          jobs: jobs.filter(r => this.allowed(current, r.property?.id)).map(r => ({ ...ref(r), title: r.title })) });
       }
       return { outcome: "completed", phone_match: matched.length ? "matched" : "unmatched", records };
     }
     if (input.action === "status") { const t = await this.target(input); const record = await this.publicStatus(input.record_type!, t.record); await this.target(input); return { outcome: "completed", phone_match: "matched", record }; }
     if (input.action === "prepare") {
       const i = input.intake;
-      if (!i) throw new Error("intake is required");
+      if (!i) throw new Permanent("intake is required");
       const missing = [!i.name && "name", !normalizePhone(i.callback_number) && "callback_number", !i.description && "description", !i.service && "service"].filter(Boolean);
       return { outcome: "draft", missing_fields: missing, location_complete: knownLocation(i) || !!i.property_id, assessment_mode: "unscheduled" };
     }
@@ -200,13 +281,16 @@ export class VoiceService {
       else await this.submit(input, saved);
       saved.outcome = "completed";
     } catch (error) {
-      saved.outcome = error instanceof Uncertain ? "uncertain" : Object.keys(saved.records).length ? "partial" : "failed";
-      saved.reason = error instanceof Uncertain ? "Write requires reconciliation; no automatic retry." : "Staff review required; no further writes were dispatched.";
+      const permanent=error instanceof Permanent || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError || error instanceof JobberGraphQLRequestError;
+      saved.outcome = error instanceof Uncertain ? "uncertain" : permanent ? (Object.keys(saved.records).length ? "partial" : "failed") : "pending";
+      saved.reason_code = error instanceof Uncertain ? "write_uncertain" : permanent ? "validation_or_authorization" : error instanceof DirectoryIncomplete ? "directory_incomplete" : "lookup_unavailable";
+      saved.retry_at=Date.now()+15000;
+      saved.reason = error instanceof Uncertain ? "Write requires reconciliation; no automatic retry." : saved.outcome==="pending" ? "Jobber read unavailable; confirmed work remains pending." : "Jobber request was not completed; staff review required.";
     } finally {
       try { this.journal.save(input.operation_id, saved); }
       finally { this.running.delete(input.operation_id); release(); }
     }
-    await appendAuditLog({ account_id: this.accountId, tool: `voice_${input.action}`, args: { operation_id: input.operation_id, call_id: input.call_id }, outcome: saved.outcome === "completed" ? "success" : "error" });
+    await appendAuditLog({ account_id: this.accountId, service_session_id:"voice-service", tool: `voice_${input.action}`, args: { operation_id: input.operation_id, call_id: input.call_id, reason_code: saved.reason_code, stage: Object.keys(saved.records).at(-1) || "prerequisite_reads" }, outcome: saved.outcome === "completed" ? "success" : "error" });
     return saved;
   }
   private async write(input: VoiceInput, result: VoiceResult, step: string, query: string, variables: Record<string, unknown>, payload: string, field: string, verify: (record: any) => Promise<any>): Promise<any> {
@@ -222,9 +306,9 @@ export class VoiceService {
       if (input.action === "message" && input.record_id) await this.target(input);
       if (input.action === "submit" && result.phone_match === "matched" && result.records.client?.id) {
         const m=await this.fresh(normalizePhone(input.caller_number),result.records.client.id);
-        if (!this.allowed(m,result.records.property?.id)) throw new Error("Property no longer accessible");
+        if (!this.allowed(m,result.records.property?.id)) throw new Permanent("Property no longer accessible");
       }
-      if ((await this.run(`query VoiceAccount{account{id}}`, {}, 1)).account?.id !== this.accountId) throw new Error("Voice Jobber account mismatch");
+      if ((await this.run(`query VoiceAccount{account{id}}`, {}, 1)).account?.id !== this.accountId) throw new Permanent("Voice Jobber account mismatch");
       this.journal.dispatched(id, step);
       try {
         const data = await this.run(query, variables, 300);
@@ -235,7 +319,10 @@ export class VoiceService {
           result.records[step] = ref(record); this.journal.save(id, result);
         }
         if (!record?.id || data[payload]?.userErrors?.length || !Array.isArray(data[payload]?.userErrors)) throw new Uncertain();
-      } catch { throw new Uncertain(); }
+      } catch (error) {
+        if(error instanceof BudgetUnavailableError || error instanceof RequestRateLimitError) {this.journal.notDispatched(id,step);throw error;}
+        throw new Uncertain();
+      }
     }
     try {
       const checked = await verify(record);
@@ -314,7 +401,7 @@ export class VoiceService {
     });
   }
   private async message(input: VoiceInput, result: VoiceResult): Promise<void> {
-    if (!input.message?.trim()) throw new Error("message is required");
+    if (!input.message?.trim()) throw new Permanent("message is required");
     if (!input.record_id) { result.phone_match = "unverified"; result.email_only = true; return; }
     const { record } = await this.target(input);
     result.phone_match = "matched"; result.records[input.record_type!] = ref(record);
@@ -322,12 +409,10 @@ export class VoiceService {
   }
   private async submit(input: VoiceInput, result: VoiceResult): Promise<void> {
     const i = input.intake;
-    if (!i || !i.name || !i.description || !i.service || !normalizePhone(i.callback_number)) throw new Error("Incomplete intake");
+    if (!i || !i.name || !i.description || !i.service || !normalizePhone(i.callback_number)) throw new Permanent("Incomplete intake");
     const number = normalizePhone(input.caller_number);
     const previouslyDispatched = this.journal.step(input.operation_id!, "client");
-    const all = await this.clients();
-    const matches: Match[] = [];
-    if (number) for (const c of all) { const m = await this.match(c, number); if (m) matches.push(m); }
+    const matches = previouslyDispatched ? [] : await this.matches(number);
     let client: any, property: any;
     if (previouslyDispatched) {
       if (previouslyDispatched.state === "dispatched" || !previouslyDispatched.record?.id) throw new Uncertain();
@@ -335,17 +420,17 @@ export class VoiceService {
       if (!client || !client.phones.some((p: any) => normalizePhone(p.number) === normalizePhone(i.callback_number))) throw new Uncertain();
     } else if (matches.length) {
       const selected = i.client_id ? matches.find(m => m.client.id === i.client_id) : matches.length === 1 ? matches[0] : undefined;
-      if (!selected) throw new Error("Select client");
+      if (!selected) throw new Permanent("Select client");
       const m = await this.fresh(number, selected.client.id); client = m.client;
       const candidates = client.properties.filter((p:any)=>i.property_id ? p.id === i.property_id : sameAddress(p,i));
-      if (candidates.length > 1) throw new Error("Ambiguous property requires staff review");
+      if (candidates.length > 1) throw new Permanent("Ambiguous property requires staff review");
       property = candidates[0];
-      if (i.property_id && !property || property && !this.allowed(m, property.id) || m.propertyIds && !property) throw new Error("Property not accessible");
+      if (i.property_id && !property || property && !this.allowed(m, property.id) || m.propertyIds && !property) throw new Permanent("Property not accessible");
     } else {
-      if (i.client_id || i.property_id) throw new Error("Existing records require a matched calling number");
+      if (i.client_id || i.property_id) throw new Permanent("Existing records require a matched calling number");
       // Include linked contact phones/emails in duplicate checks, even when caller ID differs.
-      for (const c of all) {
-        if (c.properties.some((p:any)=>sameAddress(p,i)) || await this.duplicateContact(c.id, i.name, i.email) || await this.match(c, normalizePhone(i.callback_number)! ) || c.name?.trim().toLowerCase() === (i.company || i.name).toLowerCase() || i.email && c.emails.some((e: any) => e.address.toLowerCase() === i.email.toLowerCase())) throw new Error("Potential duplicate requires staff review");
+      for (const c of await this.clients()) {
+        if (c.properties.some((p:any)=>sameAddress(p,i)) || await this.duplicateContact(c.id, i.name, i.email) || await this.match(c, normalizePhone(i.callback_number)! ) || c.name?.trim().toLowerCase() === (i.company || i.name).toLowerCase() || i.email && c.emails.some((e: any) => e.address.toLowerCase() === i.email.toLowerCase())) throw new Permanent("Potential duplicate requires staff review");
       }
       client = await this.write(input, result, "client", newClient, { input: { firstName: i.name, ...(i.company ? { companyName: i.company, isCompany: true } : {}), phones: [{ number: normalizePhone(i.callback_number), primary: true, smsAllowed: false }], emails: i.email ? [{ address: i.email, primary: true }] : [], receivesReminders: false, receivesFollowUps: false, receivesQuoteFollowUps: false, receivesInvoiceFollowUps: false, receivesReviewRequests: false } }, "clientCreate", "client", async r => {
         const current = (await this.run(clientQuery, { id: r.id }, 1000)).client;

@@ -158,3 +158,15 @@ operation outcome counts. `scripts/voice-fixture.mjs` is a loopback-only fake
 Jobber backend for Ermine's opt-in cross-repository test; it isolates all audit and
 OAuth state from the developer's home directory and Keychain. Mock verification
 and schema validation do not replace testing scopes and writes on a Jobber test account.
+
+Voice HTTP dispatch returns completed results or durable pending IDs within two
+seconds. A background worker resumes pending/uncertain operations from the journal;
+safe prerequisite read failures remain pending instead of becoming permanent write
+failures. Read-only resolve/status operations are also journaled and freshly
+reauthorized when polled. Per-operation scan checkpoints preserve completed pages.
+The complete, account-scoped SQLite phone directory refreshes in the background,
+including property-level contacts. It provides discovery candidates only; phone,
+record membership and property restrictions are reread before disclosure/writes.
+An index miss never authorizes new-client creation: complete duplicate checks still
+run before creation. `/voice/v1/health` includes directory completeness, refresh and
+failure timestamps. All new tables are additive and must survive rollback.
