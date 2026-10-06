@@ -227,3 +227,109 @@ it("does not mark a mutation dispatched when budget admission rejects it before 
  expect((await f.service.execute(args)).outcome).toBe("pending");expect(f.journal.step(args.operation_id,"client")).toBeUndefined();
  expect((await f.service.execute(args)).outcome).toBe("completed");expect(f.cs.length).toBe(1);
 });
+
+it("completed slow resolve must become observable by polling", async()=>{
+ vi.useFakeTimers();
+ try {
+  const f=fixture(), original=f.run.getMockImplementation()!;
+  f.journal.addDirectoryPhone("williams","gen","+17055550100","c1");f.journal.publishDirectory("williams","gen");
+  f.run.mockImplementation(async(q,v)=>{if(q.includes("VoiceClientJobs"))await new Promise(r=>setTimeout(r,2500));return original(q,v);});
+  const args={action:"resolve",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID()};
+  let work=f.service.dispatch(args);await vi.advanceTimersByTimeAsync(2000);expect((await work).outcome).toBe("pending");
+  await vi.advanceTimersByTimeAsync(501);expect(f.journal.get(args.operation_id,args.call_id).outcome).toBe("completed");
+  const observations=[];
+  for(let n=0;n<3;n++){
+   work=f.service.dispatch({...args,action:"operation_status"});await vi.advanceTimersByTimeAsync(2000);observations.push((await work).outcome);await vi.advanceTimersByTimeAsync(501);
+  }
+  expect(observations).toContain("completed");
+ }finally{vi.useRealTimers();}
+});
+it("explicit mutation validation rejection must settle for correction",async()=>{
+ const f=fixture(false),original=f.run.getMockImplementation()!;
+ f.run.mockImplementation(async(q,v)=>q.includes("VoiceCreateClient")?{clientCreate:{client:null,userErrors:[{message:"First name is too long",path:["input","firstName"]}]}}:original(q,v));
+ const args=input();const first=await f.service.execute(args);
+ const next=await f.service.execute({action:"operation_status",call_id:args.call_id,caller_number:args.caller_number,operation_id:args.operation_id});
+ expect({first:first.outcome,next:next.outcome}).toEqual({first:"failed",next:"failed"});
+});
+it("account verification failure must appear in index health",async()=>{
+ const f=fixture();f.journal.publishDirectory("williams","gen");
+ f.run.mockRejectedValue(new Error("OAuth unavailable"));
+ await expect(f.service.directory.refresh()).rejects.toThrow("OAuth unavailable");
+ expect(f.service.directory.status().last_failure_at).not.toBeNull();
+});
+it("invalid email is rejected before connector journal",async()=>{
+ const f=fixture(false),app=new Hono(),key="x".repeat(40);registerVoiceRoutes(app,f.service,key);
+ const args={...input(),intake:{...intake,email:"not-an-email"}};
+ const response=await app.request("/voice/v1/execute",{method:"POST",headers:{Authorization:`Bearer ${key}`,"Content-Type":"application/json"},body:JSON.stringify(args)});
+ expect(response.status).toBe(422);const value=await response.json();expect(value.outcome).toBe("failed");expect(value.reason_code).toBe("invalid_input");expect(value.submission_rejected).toBe(true);expect(()=>f.journal.get(args.operation_id,args.call_id)).toThrow("not found");
+});
+
+it("reauthorizes completed reads and blocks revoked phone access",async()=>{
+ const f=fixture();f.journal.addDirectoryPhone("williams","gen","+17055550100","c1");f.journal.publishDirectory("williams","gen");
+ const args={action:"resolve",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID()};
+ expect((await f.service.dispatch(args)).phone_match).toBe("matched");
+ f.cs[0].phones=[];
+ const r=await f.service.dispatch({...args,action:"operation_status"});expect(r.outcome).toBe("failed");expect(r.records).toEqual({});
+ expect(f.journal.get(args.operation_id,args.call_id).outcome).toBe("completed");
+});
+it("slow status reauthorization is consumed without restarting after every poll",async()=>{
+ vi.useFakeTimers();
+ try{
+  const f=fixture(),original=f.run.getMockImplementation()!;
+  f.run.mockImplementation(async(q,v)=>q.includes("VoiceJob(")?{job:{id:"j1",title:"Repair",jobStatus:"ACTIVE",client:{id:"c1"},property:{id:"p1"}}}:q.includes("VoiceVisits")?(await new Promise(r=>setTimeout(r,2500)),{job:{visits:conn([])}}):original(q,v));
+  const args={action:"status",record_type:"job",record_id:"j1",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID()};
+  let work=f.service.dispatch(args);await vi.advanceTimersByTimeAsync(2000);expect((await work).outcome).toBe("pending");await vi.advanceTimersByTimeAsync(501);
+  work=f.service.dispatch({...args,action:"operation_status"});await vi.advanceTimersByTimeAsync(2000);const pending=await work;expect(pending.outcome).toBe("pending");expect(pending.reason_code).toBe("authorization_refresh");
+  await vi.advanceTimersByTimeAsync(501);
+  const completed=await f.service.dispatch({...args,action:"operation_status"});expect(completed.outcome).toBe("completed");expect(completed.record.title).toBe("Repair");
+  expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceVisits"))).toHaveLength(2);
+ }finally{vi.useRealTimers();}
+});
+it("drops expired authorization handoffs and rechecks phone access",async()=>{
+ vi.useFakeTimers();
+ try{
+  const f=fixture(),original=f.run.getMockImplementation()!;
+  let slow=false;
+  f.journal.addDirectoryPhone("williams","gen","+17055550100","c1");f.journal.publishDirectory("williams","gen");
+  f.run.mockImplementation(async(q,v)=>{if(slow && q.includes("VoiceClient("))await new Promise(r=>setTimeout(r,1100));return original(q,v);});
+  const args={action:"resolve",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID()};await f.service.dispatch(args);slow=true;
+  const work=f.service.dispatch({...args,action:"operation_status"});await vi.advanceTimersByTimeAsync(2000);expect((await work).outcome).toBe("pending");await vi.advanceTimersByTimeAsync(2301);
+  slow=false;f.cs[0].phones=[];
+  expect((await f.service.dispatch({...args,action:"operation_status"})).outcome).toBe("failed");
+ }finally{vi.useRealTimers();}
+});
+it("a rejected step survives a crash before the final outcome save",async()=>{
+ const f=fixture(false),original=f.run.getMockImplementation()!;
+ f.run.mockImplementation(async(q,v)=>q.includes("VoiceCreateClient")?{clientCreate:{client:null,userErrors:[{message:"Name rejected",path:["input","firstName"]}]}}:original(q,v));
+ const args=input();const failed=await f.service.execute(args);expect(failed.validation_errors[0].message).toBe("Name rejected");expect(f.journal.step(args.operation_id,"client")?.state).toBe("rejected");
+ f.journal.save(args.operation_id,{operation_id:args.operation_id,outcome:"pending",records:{}});
+ const restarted=new VoiceService(f.journal,f.run,"williams");const r=await restarted.dispatch(args);expect(r.outcome).toBe("failed");expect(r.reason_code).toBe("jobber_validation");expect(r.validation_errors[0].path).toEqual(["input","firstName"]);
+ expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCreateClient"))).toHaveLength(1);
+});
+it("an invalid payload under an existing operation ID cannot authorize a new corrected workflow",async()=>{
+ const f=fixture(false),args=input();await f.service.execute(args);
+ const app=new Hono(),key="x".repeat(40);registerVoiceRoutes(app,f.service,key);
+ const r=await app.request("/voice/v1/execute",{method:"POST",headers:{Authorization:`Bearer ${key}`,"Content-Type":"application/json"},body:JSON.stringify({...args,intake:{...intake,email:"invalid"}})});
+ expect((await r.json()).submission_rejected).toBe(false);expect(f.journal.get(args.operation_id,args.call_id).outcome).toBe("completed");
+});
+it("refreshes property restrictions and record ownership before delivering resolve",async()=>{
+ const f=fixture(),original=f.run.getMockImplementation()!;f.cs[0].phones=[];
+ let allowed="p1",owner="c1";
+ const job=()=>({id:"j1",title:"Private repair",client:{id:owner},property:{id:"p1"}});
+ f.run.mockImplementation(async(q,v)=>q.includes("VoiceContacts")?{client:{contacts:conn([{id:"contact",phones:conn([{number:"+17055550100"}]),properties:conn([{id:allowed}])}])}}:q.includes("VoiceClientJobs")?{client:{jobs:conn([job()])}}:q.includes("VoiceJob(")?{job:job()}:original(q,v));
+ f.journal.addDirectoryPhone("williams","gen","+17055550100","c1");f.journal.publishDirectory("williams","gen");
+ const args={action:"resolve",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID()};
+ expect((await f.service.dispatch(args)).records[0].jobs).toHaveLength(1);
+ allowed="p2";expect((await f.service.dispatch({...args,action:"operation_status"})).records[0].jobs).toEqual([]);
+ allowed="p1";owner="other-client";expect((await f.service.dispatch({...args,action:"operation_status"})).records[0].jobs).toEqual([]);
+});
+
+it("retains uncertainty for top-level execution errors merged into mutation data",async()=>{
+ const clientModule=await import("../../jobber/client.js");
+ const merged=vi.spyOn(clientModule,"hasMutationExecutionErrors").mockReturnValue(true);
+ try{
+  const f=fixture(false),original=f.run.getMockImplementation()!;
+  f.run.mockImplementation(async(q,v)=>q.includes("VoiceCreateClient")?{clientCreate:{client:null,userErrors:[{message:"Execution failed",path:["clientCreate"]}]}}:original(q,v));
+  const args=input();expect((await f.service.execute(args)).outcome).toBe("uncertain");expect(f.journal.step(args.operation_id,"client")?.state).toBe("dispatched");
+ }finally{merged.mockRestore();}
+});

@@ -19,11 +19,11 @@ export class VoiceDirectory {
     return this.refreshing;
   }
   private async build(): Promise<void> {
-    if ((await this.run(`query VoiceAccount{account{id}}`, {}, 1)).account?.id !== this.account) throw new Error("Voice Jobber account mismatch");
     const key = `directory:${this.account}`;
-    let state = this.journal.checkpoint(key) || { generation: randomUUID(), clients: [], after: null, clientsComplete: false, clientOffset: 0, contactAfter: null };
-    this.journal.setCheckpoint(key,state);
     try {
+      if ((await this.run(`query VoiceAccount{account{id}}`, {}, 1)).account?.id !== this.account) throw new Error("Voice Jobber account mismatch");
+      const state = this.journal.checkpoint(key) || { generation: randomUUID(), clients: [], after: null, clientsComplete: false, clientOffset: 0, contactAfter: null };
+      this.journal.setCheckpoint(key,state);
       while (!state.clientsComplete) {
         const c = (await this.run(clients, { after: state.after }, 500)).clients;
         this.validate(c, state.after);

@@ -1,5 +1,5 @@
 import { BudgetUnavailableError, RequestRateLimitError } from "../jobber/cost-governor.js";
-import { JobberPermissionError, JobberAuthenticationError, JobberGraphQLRequestError } from "../jobber/client.js";
+import { JobberPermissionError, JobberAuthenticationError, JobberGraphQLRequestError, hasMutationExecutionErrors } from "../jobber/client.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { VoiceDirectory, DirectoryIncomplete } from "./directory.js";
@@ -60,6 +60,9 @@ const notes = {
 };
 class Uncertain extends Error {}
 class Permanent extends Error {}
+class ValidationRejected extends Permanent {
+  constructor(readonly step: string, readonly errors: unknown[]) { super(`Jobber rejected the ${step} input`); }
+}
 function knownLocation(i: NonNullable<VoiceInput["intake"]>): boolean { return !!(i.street1 && i.city && /\d/.test(i.street1)); }
 function sameAddress(p: any, i: NonNullable<VoiceInput["intake"]>): boolean { return !!(i.street1 && i.city && p.street1?.trim().toLowerCase() === i.street1.toLowerCase() && (p.street2 || "").trim().toLowerCase() === i.street2.toLowerCase() && p.city?.trim().toLowerCase() === i.city.toLowerCase()); }
 type Match = { client: any; propertyIds: Set<string> | null };
@@ -72,10 +75,12 @@ export class VoiceService {
   private running = new Set<string>();
   private writeTail: Promise<void> = Promise.resolve();
   private jobs = new Map<string, Promise<VoiceResult>>();
+  private readChecks = new Map<string, { work: Promise<VoiceResult>; expires?: number; timer?: ReturnType<typeof setTimeout> }>();
   private lookupContext = new AsyncLocalStorage<string>();
   readonly directory: VoiceDirectory;
   constructor(private journal: VoiceJournal, private run: RunQuery, private accountId: string) { this.directory=new VoiceDirectory(journal,run,accountId); }
   directoryHealth(): Record<string,unknown> {return this.directory.status();}
+  inputNeverJournaled(id: unknown): boolean {return typeof id !== "string" || !this.journal.hasOperation(id);}
   async tick():Promise<void> { for(const op of this.journal.pending()) this.launch(voiceInput.parse(this.journal.input(op.id,op.call))); }
   /** Private HTTP dispatch is always quick; the journal owns unfinished work. */
   async dispatch(raw:unknown):Promise<VoiceResult> {
@@ -86,22 +91,69 @@ export class VoiceService {
       let result:VoiceResult;try{result=this.journal.get(input.operation_id,input.call_id);}catch{return {outcome:"not_found",operation_id:input.operation_id};}
       const original=voiceInput.parse(this.journal.input(input.operation_id,input.call_id));
       if(result.outcome==="completed" && ["resolve","status"].includes(original.action)) {
-        // A stored read result is not ongoing permission to disclose a customer's records.
-        result={operation_id:input.operation_id,outcome:"pending",records:{}};
-        this.journal.save(input.operation_id,result);
-        const work=this.launch(original);let timer:ReturnType<typeof setTimeout>;
-        try{return await Promise.race([work,new Promise<VoiceResult>(r=>{timer=setTimeout(()=>r(this.journal.get(input.operation_id!,input.call_id)),2000);})]);}finally{clearTimeout(timer!);}
+        return this.deliverRead(original, result);
       }
       if(["pending","uncertain"].includes(result.outcome) && (!result.retry_at || result.retry_at<=Date.now())) this.launch(voiceInput.parse(this.journal.input(input.operation_id,input.call_id)));
       return result;
     }
     if(!input.operation_id) input.operation_id=randomUUID();
     const saved=this.journal.start(input.operation_id,input.call_id,input);
-    if(!["pending","uncertain"].includes(saved.outcome))return saved;
+    if(!["pending","uncertain"].includes(saved.outcome))return saved.outcome === "completed" && ["resolve","status"].includes(input.action) ? this.deliverRead(input,saved) : saved;
     const work=this.launch(input);
     let timer:ReturnType<typeof setTimeout>;
-    const timeout=new Promise<VoiceResult>(resolve=>{timer=setTimeout(()=>resolve(this.journal.get(input.operation_id!,input.call_id)),2000);});
+    const timeout=new Promise<VoiceResult>(resolve=>{timer=setTimeout(()=>{const result=this.journal.get(input.operation_id!,input.call_id);resolve({...result,...(result.outcome === "pending" && !result.retry_at ? {retry_at:Date.now()+1000}: {})});},2000);});
     try{return await Promise.race([work,timeout]);}finally{clearTimeout(timer!);}
+  }
+  // Completed discovery stays durable. Each disclosure gets a fresh authorization
+  // check, without restarting directory/job-list scans. Slow checks have a single
+  // in-flight task and a one-use, two-second handoff to the next poll.
+  private async deliverRead(input: VoiceInput, result: VoiceResult): Promise<VoiceResult> {
+    const id=input.operation_id!;
+    let check=this.readChecks.get(id);
+    if(check?.expires && check.expires <= Date.now()) {clearTimeout(check.timer);this.readChecks.delete(id);check=undefined;}
+    if(!check) {
+      const entry: { work: Promise<VoiceResult>; expires?: number; timer?: ReturnType<typeof setTimeout> }={work:Promise.resolve({})};
+      this.readChecks.set(id,entry);
+      entry.work=this.reauthorizeRead(input,result).catch(error=>({operation_id:id,outcome:error instanceof Permanent || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError || error instanceof JobberGraphQLRequestError ? "failed":"pending",records:{},reason_code:error instanceof Permanent ? "authorization_changed":"lookup_unavailable",retry_at:Date.now()+1000})).then(value=>{
+        entry.expires=Date.now()+2000;
+        entry.timer=setTimeout(()=>{if(this.readChecks.get(id)===entry)this.readChecks.delete(id);},2000);entry.timer.unref();
+        return value;
+      });
+      check=entry;
+    }
+    let timer:ReturnType<typeof setTimeout>;
+    const pending={operation_id:id,outcome:"pending",records:{},reason_code:"authorization_refresh",retry_at:Date.now()+1000};
+    try {
+      const value=await Promise.race([check.work,new Promise<VoiceResult>(resolve=>{timer=setTimeout(()=>resolve(pending),2000);})]);
+      if(value!==pending) {clearTimeout(check.timer);if(this.readChecks.get(id)===check)this.readChecks.delete(id);}
+      return value;
+    } finally {clearTimeout(timer!);}
+  }
+  private async reauthorizeRead(input: VoiceInput, result: VoiceResult): Promise<VoiceResult> {
+    if((await this.run(`query VoiceAccount{account{id}}`,{},1)).account?.id!==this.accountId)throw new Permanent("Voice Jobber account mismatch");
+    if(input.action === "status") {
+      const target=await this.target(input);
+      const record=await this.publicStatus(input.record_type!,target.record);
+      await this.target(input);
+      return {...result,record};
+    }
+    const records=[];
+    for(const prior of result.records) {
+      await this.fresh(normalizePhone(input.caller_number),prior.id);
+      const requests:any[]=[],jobs:any[]=[];
+      for(const [type,list] of [["request",prior.requests],["job",prior.jobs]] as const) {
+        for(const selected of list) {
+          const record=(await this.run(type === "job" ? jobQuery:requestQuery,{id:selected.id},1000))[type];
+          if(record?.client?.id===prior.id)(type === "job" ? jobs:requests).push(record);
+        }
+      }
+      const current=await this.fresh(normalizePhone(input.caller_number),prior.id);
+      records.push({record_type:"client",...ref(current.client),name:current.client.name,selectable:!current.propertyIds,
+        properties:current.client.properties.filter((p:any)=>this.allowed(current,p.id)).map((p:any)=>({id:p.id,address:[p.street1,p.street2,p.city].filter(Boolean).join(", ")})),
+        requests:requests.filter(r=>this.allowed(current,r.property?.id)).map(r=>({...ref(r),title:r.title})),
+        jobs:jobs.filter(r=>this.allowed(current,r.property?.id)).map(r=>({...ref(r),title:r.title}))});
+    }
+    return {...result,records};
   }
   private launch(input:VoiceInput):Promise<VoiceResult> {
     const id=input.operation_id!;
@@ -277,13 +329,18 @@ export class VoiceService {
     this.writeTail = new Promise<void>(resolve => { release = resolve; });
     await previous;
     try {
+      for(const step of ["client","property","request","note","assessment"]) {
+        const prior=this.journal.step(input.operation_id,step);
+        if(prior?.state === "rejected")throw new ValidationRejected(step,prior.record?.validation_errors || []);
+      }
       if (input.action === "message") await this.message(input, saved);
       else await this.submit(input, saved);
       saved.outcome = "completed";
     } catch (error) {
       const permanent=error instanceof Permanent || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError || error instanceof JobberGraphQLRequestError;
       saved.outcome = error instanceof Uncertain ? "uncertain" : permanent ? (Object.keys(saved.records).length ? "partial" : "failed") : "pending";
-      saved.reason_code = error instanceof Uncertain ? "write_uncertain" : permanent ? "validation_or_authorization" : error instanceof DirectoryIncomplete ? "directory_incomplete" : "lookup_unavailable";
+      saved.reason_code = error instanceof ValidationRejected ? "jobber_validation" : error instanceof Uncertain ? "write_uncertain" : permanent ? "validation_or_authorization" : error instanceof DirectoryIncomplete ? "directory_incomplete" : "lookup_unavailable";
+      if(error instanceof ValidationRejected) {saved.validation_errors=error.errors;saved.failed_step=error.step;}
       saved.retry_at=Date.now()+15000;
       saved.reason = error instanceof Uncertain ? "Write requires reconciliation; no automatic retry." : saved.outcome==="pending" ? "Jobber read unavailable; confirmed work remains pending." : "Jobber request was not completed; staff review required.";
     } finally {
@@ -296,6 +353,7 @@ export class VoiceService {
   private async write(input: VoiceInput, result: VoiceResult, step: string, query: string, variables: Record<string, unknown>, payload: string, field: string, verify: (record: any) => Promise<any>): Promise<any> {
     const id = input.operation_id!;
     const old = this.journal.step(id, step);
+    if(old?.state === "rejected")throw new ValidationRejected(step,old.record?.validation_errors || []);
     if (old?.state === "verified") {
       result.records[step] = ref(old.record);
       return old.record;
@@ -318,8 +376,15 @@ export class VoiceService {
           this.journal.returned(id, step, record);
           result.records[step] = ref(record); this.journal.save(id, result);
         }
-        if (!record?.id || data[payload]?.userErrors?.length || !Array.isArray(data[payload]?.userErrors)) throw new Uncertain();
+        const errors=data[payload]?.userErrors;
+        if(!record?.id && Array.isArray(errors) && errors.length && !hasMutationExecutionErrors(data)) {
+          const details=errors.slice(0,10).map((e:any)=>({message:String(e.message || "Jobber rejected this input").slice(0,500),path:Array.isArray(e.path) ? e.path.map(String):[]}));
+          this.journal.rejected(id,step,details);
+          throw new ValidationRejected(step,details);
+        }
+        if (!record?.id || errors?.length || !Array.isArray(errors)) throw new Uncertain();
       } catch (error) {
+        if(error instanceof ValidationRejected)throw error;
         if(error instanceof BudgetUnavailableError || error instanceof RequestRateLimitError) {this.journal.notDispatched(id,step);throw error;}
         throw new Uncertain();
       }

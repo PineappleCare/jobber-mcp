@@ -30,6 +30,12 @@ const MAX_429_RETRIES = 3;
 const DEFAULT_429_BACKOFF_MS = [1000, 2000, 4000];
 const MAX_RETRY_AFTER_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 30_000;
+// Staff tools preserve partial mutation data. Voice recovery must distinguish
+// native validation errors from top-level execution errors merged into that data.
+const mutationExecutionFailures = new WeakSet<object>();
+export function hasMutationExecutionErrors(data: unknown): boolean {
+  return data !== null && typeof data === "object" && mutationExecutionFailures.has(data);
+}
 const MAX_5XX_RETRIES = 2;
 const FIVE_XX_BACKOFF_MS = [1000, 2000];
 
@@ -343,7 +349,7 @@ async function executeGraphQL<T = any>(
         }
         if (isMutation && status < 400 && body.data !== undefined) {
           const merged = mergeMutationErrorsIntoData<T>(body.data, body.errors);
-          if (merged !== undefined) return merged;
+          if (merged !== undefined) {mutationExecutionFailures.add(merged as object);return merged;}
         }
         const message = body.errors.map((e: any) => e.message).join("; ");
         if (isPermissionError(body)) throw new JobberPermissionError(message);

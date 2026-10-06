@@ -50,6 +50,7 @@ export class VoiceJournal {
   }
   directoryFailure(account:string):void {this.setCheckpoint(`directory-failure:${account}`,{at:Date.now()});this.db.prepare("UPDATE voice_directory SET failed=? WHERE account=?").run(Date.now(),account);}
   close(): void { this.db.close(); }
+  hasOperation(id: string): boolean {return !!this.db.prepare("SELECT 1 FROM voice_operations WHERE id=?").get(id);}
   start(id: string, call: string, payload: unknown): VoiceResult {
     const hash = fingerprint(payload);
     const old = this.db.prepare("SELECT * FROM voice_operations WHERE id=?").get(id) as any;
@@ -85,6 +86,9 @@ export class VoiceJournal {
   clearScan(id:string):void {this.db.prepare("DELETE FROM voice_checkpoints WHERE key LIKE ?").run(`scan:${id}:%`);}
   returned(id: string, name: string, record: VoiceResult): void {
     this.db.prepare("UPDATE voice_steps SET state='returned',record=? WHERE operation_id=? AND name=?").run(JSON.stringify(record), id, name);
+  }
+  rejected(id: string, name: string, errors: unknown[]): void {
+    this.db.prepare("UPDATE voice_steps SET state='rejected',record=? WHERE operation_id=? AND name=?").run(JSON.stringify({ validation_errors: errors }), id, name);
   }
   verified(id: string, name: string, record: VoiceResult): void {
     this.db.prepare("UPDATE voice_steps SET state='verified',record=? WHERE operation_id=? AND name=?").run(JSON.stringify(record), id, name);

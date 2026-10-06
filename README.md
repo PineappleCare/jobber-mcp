@@ -170,3 +170,19 @@ record membership and property restrictions are reread before disclosure/writes.
 An index miss never authorizes new-client creation: complete duplicate checks still
 run before creation. `/voice/v1/health` includes directory completeness, refresh and
 failure timestamps. All new tables are additive and must survive rollback.
+
+Completed reads remain in the journal when polled. Delivery rechecks account,
+caller phones, property restrictions and selected record membership; it does not
+restart full discovery. Slow authorization has one in-flight check and a one-use
+handoff expiring after two seconds. Pending replies include `retry_at`; callers
+must poll promptly to consume a completed check. Expired checks and process
+restarts require fresh authorization.
+
+Schema rejection returns `failed` / `invalid_input` with `invalid_fields`.
+`submission_rejected: true` is returned only when the operation ID never entered
+the connector journal. Existing IDs cannot use that marker to bypass recovery.
+Explicit mutation validation errors with no returned record are stored as
+`rejected` steps and settle as failed/partial with error details. Transport loss,
+missing responses and top-level execution errors retain uncertainty. Rejected
+steps survive restarts and are never redispatched. Index account-check failures
+are included in refresh health reporting.

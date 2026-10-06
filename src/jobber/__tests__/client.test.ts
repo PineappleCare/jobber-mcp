@@ -16,6 +16,7 @@ vi.mock("../../utils/sessionContext.js", () => ({
 import {
   jobberGraphQL,
   jobberGraphQLWrite,
+  hasMutationExecutionErrors,
   JobberApiError,
   JobberAuthenticationError,
   JobberGraphQLRequestError,
@@ -297,7 +298,10 @@ describe("jobberGraphQL - GraphQL errors", () => {
       )
     );
 
-    await expect(jobberGraphQLWrite("mutation { visitCreate { createdVisits { id } userErrors { message path } } }", undefined, 10)).resolves.toEqual({
+    const result=await jobberGraphQLWrite("mutation { visitCreate { createdVisits { id } userErrors { message path } } }", undefined, 10);
+    expect(hasMutationExecutionErrors(result)).toBe(true);
+    expect(hasMutationExecutionErrors({visitCreate:{createdVisits:null,userErrors:[{message:"Invalid input"}]}})).toBe(false);
+    expect(result).toEqual({
       visitCreate: {
         createdVisits: [{ id: "visit-created" }],
         userErrors: [{ message: "The second visit was rejected", path: ["visitCreate", "visits", "1"] }],
