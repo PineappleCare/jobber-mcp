@@ -148,11 +148,11 @@ describe("native tasks", () => {
   it("version includes assignments, instructions, links, recurrence and completion", () => {
     for (const patch of [{ instructions: "x" }, { client: { id: "other" } }, { isComplete: true }, { isRecurring: true }, { assignedUsers: { nodes: [], pageInfo: { hasNextPage: false } } }]) expect(taskVersion(task(patch))).not.toBe(taskVersion(task()));
   });
-  it("blocks unverified one-off and implicit recurring jobs before dispatch", async () => {
+  it("requires explicit recurring billing before dispatch", async () => {
     const server: any = { registerTool: vi.fn() }; registerFoundationalTools(server);
     const [, config, handler] = server.registerTool.mock.calls.find((c: any[]) => c[0] === "create_job");
-    const parsed = await config.inputSchema["~standard"].validate({ property_id: "p", billing_type: "FIXED_PRICE", billing_schedule: "ON_COMPLETION", confirm_write: true });
-    expect(parsed.value.job_type).toBe("ONE_OFF"); expect((await handler(parsed.value)).isError).toBe(true);
+    const parsed = await config.inputSchema["~standard"].validate({ property_id: "p", title: "Work", job_type: "RECURRING", confirm_write: true });
+    expect(parsed.issues).toBeUndefined(); expect((await handler(parsed.value)).isError).toBe(true);
     expect(read).not.toHaveBeenCalled(); expect(write).not.toHaveBeenCalled();
   });
 });

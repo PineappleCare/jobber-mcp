@@ -277,13 +277,13 @@ describe("foundational operations", () => {
     expect(JSON.parse(result.content[0].text).outcome).toBe("created");
   });
 
-  it("creates six assigned Anytime visits in one mutation and verifies each result", async () => {
+  it("creates six assigned Anytime visits on a one-off job without changing its type", async () => {
     process.env.JOBBER_READ_ONLY = "false";
     process.env.JOBBER_WRITE_CAPABILITIES = "scheduling";
     const dates = ["2026-09-18", "2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25"];
     const users = [{ id: "matt" }, { id: "ryan" }];
     const visits = dates.map((date, index) => ({ id: `visit-${index}`, title: "Rough-in", allDay: true, startAt: `${date}T00:00:00-04:00`, endAt: `${date}T00:00:00-04:00`, assignedUsers: { nodes: users } }));
-    const page = (nodes: any[]) => ({ job: { id: "job-1", jobStatus: "ACTIVE", visits: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } });
+    const page = (nodes: any[]) => ({ job: { id: "job-1", jobType: "ONE_OFF", jobStatus: "ACTIVE", visits: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } });
     mockRead
       .mockResolvedValueOnce(page([]))
       .mockResolvedValueOnce({ users: { nodes: users.map((user) => ({ ...user, availableForScheduling: true, status: "ACTIVATED" })), pageInfo: { hasNextPage: false, endCursor: null } } })
@@ -302,6 +302,9 @@ describe("foundational operations", () => {
     expect(payload.outcome).toBe("created");
     expect(payload.results).toHaveLength(6);
     expect(payload.results.every((item: any) => item.verification === "verified")).toBe(true);
+    expect(mockWrite).toHaveBeenCalledTimes(1);
+    expect(mockWrite.mock.calls[0][0]).not.toMatch(/jobCreate|jobEdit/);
+    expect(mockWrite.mock.calls[0][1].jobId).toBe("job-1");
     expect(mockWrite.mock.calls.filter(([query]) => query.includes("mutation CreateVisits"))).toHaveLength(1);
   });
 

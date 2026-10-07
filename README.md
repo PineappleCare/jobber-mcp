@@ -42,12 +42,24 @@ editing is exposed. Creation scans for identical tasks, blocks incomplete scans,
 and never retries an ambiguous mutation. Returned IDs remain available when
 readback fails or Jobber reports partial errors.
 
-Job reads include `jobType`. `create_job` now defaults to `job_type: ONE_OFF`
-and blocks before writing because the reviewed live API has no verified one-off
-creation selector. An explicit `RECURRING` choice is required for the existing
-recurring/as-needed API path, with fresh type readback. Fixed-price billing is
-not proof of a one-off job. Never substitute a recurring job or task for a
-requested one-off job, and never claim conversion of an existing job.
+Job reads include `jobType` and billing information. `create_job` defaults to
+`job_type: ONE_OFF`, with `FIXED_PRICE` / `ON_COMPLETION` billing. This native
+combination was verified through an explicitly authorized internal live probe;
+there is no explicit job-type field in Jobber's creation input. Other one-off
+billing combinations remain unavailable until verified. Jobs start unscheduled,
+without visits, assignments, team notification or review-request SMS. Create
+explicitly requested visits separately. Several visits do not imply recurrence.
+An explicit `RECURRING` choice requires explicit `VISIT_BASED` billing and a
+non-periodic billing schedule; periodic scheduling is outside this tool.
+
+The title is required for complete duplicate checking, bounded at 500 property
+jobs; incomplete scans block mutation. Source quote/request relationships are
+checked before creation. Only `outcome: created` confirms readback of the type,
+billing, destination/source, title, instructions, line items and unscheduled state.
+Partial or ambiguous responses preserve returned IDs and reconcile through reads
+without repeating the mutation. Candidates found after a timeout are evidence
+to review, not proof of successful creation. Never automatically convert, delete
+or recreate a mismatched job. See [the creation contract](docs/ONE_OFF_CONTRACT.md).
 
 `list_notes` returns paginated, versioned notes for clients, requests, quotes,
 jobs, and invoices. With `records` enabled, `create_note` and `update_note`
