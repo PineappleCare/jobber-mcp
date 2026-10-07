@@ -29,6 +29,26 @@ Foundation reads are `search_records`, `get_record`, `catalog_search`, and
 `team_list`. They cover clients, properties, requests, quotes, jobs, invoices,
 visits, products/services, and assignable users.
 
+`list_tasks` and `get_task` expose native tasks with schedules, assignments,
+links and a content-derived `task_version`. The `scheduling` capability enables
+approval-required `create_task` and `update_task` for non-recurring tasks. Use
+explicit anytime (all-day), timed or unscheduled schedules; timezone defaults to
+America/Toronto. Optional client/property links are checked against this account.
+Assignment emails require `notify_team: true` (default false); they are not SMS
+and delivery is not verified. Timed assigned tasks may request a supported team
+reminder. Updates require `expected_task_version`, preserve omitted fields and
+reject completed/recurring tasks. No task deletion, completion or recurrence
+editing is exposed. Creation scans for identical tasks, blocks incomplete scans,
+and never retries an ambiguous mutation. Returned IDs remain available when
+readback fails or Jobber reports partial errors.
+
+Job reads include `jobType`. `create_job` now defaults to `job_type: ONE_OFF`
+and blocks before writing because the reviewed live API has no verified one-off
+creation selector. An explicit `RECURRING` choice is required for the existing
+recurring/as-needed API path, with fresh type readback. Fixed-price billing is
+not proof of a one-off job. Never substitute a recurring job or task for a
+requested one-off job, and never claim conversion of an existing job.
+
 `list_notes` returns paginated, versioned notes for clients, requests, quotes,
 jobs, and invoices. With `records` enabled, `create_note` and `update_note`
 create or edit text, pinned state, and supported record links after approval.

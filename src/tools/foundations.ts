@@ -40,7 +40,7 @@ const clientFields = `${summaryFields} name firstName lastName companyName email
 const propertyFields = `id name street1 street2 city province postalCode country jobberWebUri`;
 const requestFields = `${summaryFields} title requestStatus createdAt client { id name } property { id name }`;
 const quoteFields = `${summaryFields} quoteNumber title quoteStatus sentAt message amounts { total } client { id name } property { id name }`;
-const jobFields = `${summaryFields} jobNumber title jobStatus instructions total client { id name } property { id name } quote { id } request { id }`;
+const jobFields = `${summaryFields} jobNumber title jobType jobStatus instructions total client { id name } property { id name } quote { id } request { id }`;
 const invoiceFields = `${summaryFields} invoiceNumber subject invoiceStatus issuedDate dueDate receivedDate amounts { total invoiceBalance } client { id name }`;
 const visitFields = `id title visitStatus isComplete completedAt allDay startAt endAt instructions job { id jobNumber title } client { id name } assignedUsers(first: 20) { nodes { id name { full } } }`;
 
@@ -308,7 +308,8 @@ function registerQuoteJobInvoiceWrites(server: McpServer): void {
     if (args.title === undefined && args.message === undefined && args.contract_disclaimer === undefined) throw new Error("Provide at least one quote field to update.");
     const data = await run<Node>(`mutation EditQuote($quoteId:EncodedId!,$attributes:QuoteEditAttributes!){quoteEdit(quoteId:$quoteId,attributes:$attributes){quote{${quoteFields}} userErrors{message path}}}`, { quoteId: args.quote_id, attributes: { title: args.title, message: args.message, contractDisclaimer: args.contract_disclaimer } }); const quote = mutationRecord("updating draft quote", data, "quoteEdit", "quote"); await audit("update_draft_quote", args, quote); return response("updated", "quote", quote);
   });
-  registerWriteTool(server, "create_job", { description: "Create a Jobber fixed-price or visit-based job from a property and optional request or quote.", capability: "records", inputSchema: { property_id: z.string().min(1), quote_id: z.string().min(1).optional(), request_id: z.string().min(1).optional(), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), billing_type: z.enum(["FIXED_PRICE", "VISIT_BASED"]), billing_schedule: z.enum(["ON_COMPLETION", "PERIODIC", "PER_VISIT", "NEVER"]), line_items: z.array(lineItemSchema).max(100).default([]), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
+  registerWriteTool(server, "create_job", { description: "Create an explicitly requested recurring/as-needed Jobber job. Defaults to ONE_OFF, which is blocked before writing because this API exposes no verified one-off selector. Fixed-price billing does not establish a one-off job. Existing job conversion is unavailable.", capability: "records", inputSchema: { job_type: z.enum(["ONE_OFF", "RECURRING"]).default("ONE_OFF"), property_id: z.string().min(1), quote_id: z.string().min(1).optional(), request_id: z.string().min(1).optional(), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), billing_type: z.enum(["FIXED_PRICE", "VISIT_BASED"]), billing_schedule: z.enum(["ON_COMPLETION", "PERIODIC", "PER_VISIT", "NEVER"]), line_items: z.array(lineItemSchema).max(100).default([]), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
+    if (args.job_type !== "RECURRING") throw new Error("One-off job creation is not verified by this Jobber API contract; no job was created. Use the Jobber one-off workflow. Select RECURRING only when the operator explicitly requests a recurring/as-needed job.");
     if (args.quote_id && args.request_id) throw new Error("Choose either a source quote or source request, not both.");
     const source = await run<Node>(`query JobPreflight($propertyId:EncodedId!){property(id:$propertyId){id client{id} jobs(first:50){nodes{id title jobStatus}}}}`, { propertyId: args.property_id });
     assertRelationship(source.property, "Property not found; no job was created.");
@@ -323,7 +324,14 @@ function registerQuoteJobInvoiceWrites(server: McpServer): void {
       assertRelationship(requestSource.request.jobs.nodes.length === 0 && normalized(requestSource.request.requestStatus) !== "archived", "The source request is archived or already has a job; no duplicate job was created.");
     }
     if (args.title && source.property.jobs.nodes.some((job: Node) => normalized(job.title) === normalized(args.title) && !["closed", "archived"].includes(normalized(job.jobStatus)))) throw new Error("A matching active job already exists at this property; no job was created.");
-    const data = await run<Node>(`mutation CreateJob($input:JobCreateAttributes!){jobCreate(input:$input){job{${jobFields}} userErrors{message path}}}`, { input: { propertyId: args.property_id, quoteId: args.quote_id, requestId: args.request_id, title: args.title, instructions: args.instructions, lineItems: linesToJob(args.line_items), invoicing: { invoicingType: args.billing_type, invoicingSchedule: args.billing_schedule }, scheduling: { createVisits: false, notifyTeam: false } } }); const job = mutationRecord("creating job", data, "jobCreate", "job"); await audit("create_job", args, job); return response("created", "job", job);
+    const data = await run<Node>(`mutation CreateJob($input:JobCreateAttributes!){jobCreate(input:$input){job{${jobFields}} userErrors{message path}}}`, { input: { propertyId: args.property_id, quoteId: args.quote_id, requestId: args.request_id, title: args.title, instructions: args.instructions, lineItems: linesToJob(args.line_items), invoicing: { invoicingType: args.billing_type, invoicingSchedule: args.billing_schedule }, scheduling: { createVisits: false, notifyTeam: false } } }); const job = mutationRecord("creating job", data, "jobCreate", "job");
+    let verified: Node | undefined;
+    try { verified = (await run<Node>(`query CreatedJobType($id:EncodedId!){job(id:$id){${jobFields}}}`, { id: job.id })).job; } catch { /* Retain the created ID; never repeat creation. */ }
+    if (!verified || verified.jobType !== args.job_type) {
+      await audit("create_job", args, job);
+      return { content: [{ type: "text", text: JSON.stringify({ outcome: "uncertain", record_type: "job", record: verified ?? job, guidance: "Job was returned but its requested type could not be verified. Read this ID before any new approved write; creation was not retried." }) }], isError: true };
+    }
+    await audit("create_job", args, verified); return response("created", "job", verified);
   });
   registerJobLineItemDescriptions(server);
   registerWriteTool(server, "update_job", { description: "Update title or instructions on a reviewed Jobber job.", capability: "records", inputSchema: { job_id: z.string().min(1), expected_updated_at: z.string().min(1), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
@@ -365,7 +373,7 @@ function timezoneFormatter(timezone: string): Intl.DateTimeFormat {
   return formatter;
 }
 
-function localInstant(date: string, time: string, timezone: string, label: string): number {
+export function localInstant(date: string, time: string, timezone: string, label: string): number {
   const [year, month, day] = date.split("-").map(Number);
   const parts = time.split(":").map(Number);
   const [hour, minute, second = 0] = parts;
@@ -385,7 +393,7 @@ function localInstant(date: string, time: string, timezone: string, label: strin
   return unique[0];
 }
 
-function calendarDateInTimezone(value: unknown, timezone: string): string | undefined {
+export function calendarDateInTimezone(value: unknown, timezone: string): string | undefined {
   if (typeof value !== "string" || !value) return undefined;
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
   const instant = Date.parse(value);
@@ -488,7 +496,7 @@ async function loadVisitPreflight(jobId: string, run: any): Promise<{ job: Node 
   throw new Error("The job has too many visits to safely complete duplicate checking; no write was attempted.");
 }
 
-async function assertSchedulableUsers(requestedIds: string[], run: any): Promise<void> {
+export async function assertSchedulableUsers(requestedIds: string[], run: any): Promise<void> {
   let cursor: string | undefined;
   let complete = false;
   const users = new Map<string, Node>();
