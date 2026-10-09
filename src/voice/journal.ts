@@ -60,7 +60,7 @@ export class VoiceJournal {
   checkpoint(key:string): any { const row=this.db.prepare("SELECT value FROM voice_checkpoints WHERE key=?").get(key) as any; return row ? JSON.parse(row.value):undefined; }
   setCheckpoint(key:string,value:unknown):void { this.db.prepare("INSERT INTO voice_checkpoints VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key,JSON.stringify(value)); }
   deleteCheckpoint(key:string):void {this.db.prepare("DELETE FROM voice_checkpoints WHERE key=?").run(key);}
-  directoryStatus(account:string):Record<string,unknown> { const row=this.db.prepare("SELECT completed,failed FROM voice_directory WHERE account=?").get(account) as any; return {complete:!!row,completed_at:row?.completed ?? null,last_failure_at:row?.failed ?? this.checkpoint(`directory-failure:${account}`)?.at ?? null,refresh_in_progress:!!this.checkpoint(`directory:${account}`)}; }
+  directoryStatus(account:string):Record<string,unknown> { const row=this.db.prepare("SELECT completed,failed FROM voice_directory WHERE account=?").get(account) as any; const failure=this.checkpoint(`directory-failure:${account}`),progress=this.checkpoint(`directory:${account}`); return {complete:!!row,completed_at:row?.completed ?? null,last_failure_at:row?.failed ?? failure?.at ?? null,last_failure_stage:failure?.stage ?? null,last_failure_reason:failure?.reason_code ?? null,refresh_in_progress:!!progress,refresh_clients:progress?.clients?.length ?? 0,refresh_contacts_completed:progress?.clientOffset ?? 0}; }
   directoryCandidates(account:string,phone:string):string[]|undefined {
     const row=this.db.prepare("SELECT generation FROM voice_directory WHERE account=?").get(account) as any;
     if(!row)return undefined;
@@ -84,7 +84,7 @@ export class VoiceJournal {
       this.db.exec("COMMIT");
     } catch(e){this.db.exec("ROLLBACK");throw e;}
   }
-  directoryFailure(account:string):void {this.setCheckpoint(`directory-failure:${account}`,{at:Date.now()});this.db.prepare("UPDATE voice_directory SET failed=? WHERE account=?").run(Date.now(),account);}
+  directoryFailure(account:string,details:{stage:string,reason_code:string}):void {this.setCheckpoint(`directory-failure:${account}`,{at:Date.now(),...details});this.db.prepare("UPDATE voice_directory SET failed=? WHERE account=?").run(Date.now(),account);}
   close(): void { this.db.close(); }
   hasOperation(id: string): boolean {return !!this.db.prepare("SELECT 1 FROM voice_operations WHERE id=?").get(id);}
   start(id: string, call: string, payload: unknown): VoiceResult {

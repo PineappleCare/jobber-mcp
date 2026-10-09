@@ -18,6 +18,8 @@ describe("durable directory",()=>{
   });
   const first=new VoiceService(j,run,"williams");
   await expect(first.directory.refresh()).rejects.toThrow("connection lost");expect(first.directory.candidates("+17055550103")).toBeUndefined();expect(first.directory.status().last_failure_at).not.toBeNull();
+  expect(first.directory.status()).toMatchObject({last_failure_stage:"contacts",last_failure_reason:"read_unavailable",refresh_clients:1,refresh_contacts_completed:0});
+  expect(JSON.stringify(first.directory.status())).not.toContain("connection lost");
   fail=false;const restarted=new VoiceService(j,run,"williams");await restarted.directory.refresh();
   expect(run.mock.calls.filter(([q])=>q.includes("VoiceIndexClients")).length).toBe(1);
   for(const n of ["0100","0102","0103","0104"])expect(restarted.directory.candidates(`+1705555${n}`)).toEqual(["c1"]);

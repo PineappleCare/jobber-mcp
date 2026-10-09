@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { JobberAuthenticationError, JobberGraphQLRequestError } from "../jobber/errors.js";
 import type { VoiceJournal } from "./journal.js";
 import type { RunQuery } from "./service.js";
 import { normalizePhone } from "./service.js";
@@ -22,15 +23,18 @@ export class VoiceDirectory {
   }
   private async build(): Promise<void> {
     const key = `directory:${this.account}`;
+    let stage="account";
     try {
-      if ((await this.run(`query VoiceAccount{account{id}}`, {}, 1)).account?.id !== this.account) throw new Error("Voice Jobber account mismatch");
+      if ((await this.run(`query VoiceAccount{account{id}}`, {}, 1)).account?.id !== this.account) throw new JobberAuthenticationError("Voice Jobber account mismatch");
       const checkpoint=this.journal.checkpoint(key);
       // Old phone-only builds cannot be published as a complete metadata census.
       // Keep their previously published index available while a new build runs.
       const state = checkpoint?.version===2 ? checkpoint : { version:2,started_at:Date.now(),generation: randomUUID(), clients: [], after: null, clientsComplete: false, clientOffset: 0, contactAfter: null };
       this.journal.setCheckpoint(key,state);
       while (!state.clientsComplete) {
-        const c = (await this.run(clients, { after: state.after }, 500)).clients;
+        stage="clients";
+        // Live requested cost is 755 on the pinned API; reserve above it.
+        const c = (await this.run(clients, { after: state.after }, 800)).clients;
         this.validate(c, state.after);
         for (const client of c.nodes) {
           state.clients.push(client.id);
@@ -42,17 +46,20 @@ export class VoiceDirectory {
       }
       while (state.clientOffset < state.clients.length) {
         const id = state.clients[state.clientOffset];
+        stage="contacts";
         const c = (await this.run(contacts, { id, after: state.contactAfter }, 800)).client?.contacts;
         this.validate(c, state.contactAfter);
         for (const contact of c.nodes) {
           this.validate(contact.phones, null);
           const metadata={...contact,observed_at:Date.now()};
           for(const [field,query] of [["emails",emails],["properties",properties]] as const) {
+            stage=`contact_${field}`;
             this.validate(contact[field],null);
             const values=[...contact[field].nodes];let connection=contact[field];
             while(connection.pageInfo.hasNextPage){const after=connection.pageInfo.endCursor;connection=(await this.run(query,{id:contact.id,after},300)).clientContact?.[field];this.validate(connection,after);values.push(...connection.nodes);}
             metadata[field]=values;
           }
+          stage="contact_phones";
           for (const p of contact.phones.nodes) this.add(state.generation, id, p.number);
           const phoneValues=[...contact.phones.nodes];
           let more = contact.phones.pageInfo.hasNextPage, after = contact.phones.pageInfo.endCursor;
@@ -73,7 +80,9 @@ export class VoiceDirectory {
       this.journal.setCheckpoint(`directory-metadata:${this.account}`,{generation:state.generation,started_at:state.started_at,completed_at:Date.now()});
       this.journal.deleteCheckpoint(key);
     } catch (error) {
-      this.journal.directoryFailure(this.account);
+      // Only fixed classifications leave this boundary; provider errors can contain PII.
+      const reason=error instanceof JobberAuthenticationError ? "account_or_authentication" : error instanceof DirectoryIncomplete ? "incomplete_response" : error instanceof JobberGraphQLRequestError ? "provider_rejected_read" : "read_unavailable";
+      this.journal.directoryFailure(this.account,{stage,reason_code:reason});
       throw error;
     }
   }
