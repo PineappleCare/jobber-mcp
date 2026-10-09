@@ -227,3 +227,14 @@ timestamped resumable full passes (including contacts independently of client
 updates), with a ten-minute active-work bound. Worker leases, due times and
 15-second to five-minute reconciliation backoff protect pending/uncertain writes.
 The staff MCP interface and approval contract remain unchanged.
+
+## Private contact synchronization API
+
+`JOBBER_CONTACT_SYNC_ENABLED=true` exposes fixed paginated client/contact/email/phone
+reads at `GET /contact-sync/v1/page?kind=clients`. Configure a separate
+`JOBBER_CONTACT_SYNC_API_KEY` (at least 32 characters), pinned
+`JOBBER_CONTACT_SYNC_ACCOUNT_ID`, and existing persistent `JOBBER_STATE_DIR`.
+The service credential cannot authenticate `/mcp` or the voice API. Browser origins
+and arbitrary operations are rejected. No Jobber mutation is available. Keep this
+route on the private Docker network. Only the Williams contact worker receives its
+service credential; the connector remains the sole owner of OAuth/refresh state.

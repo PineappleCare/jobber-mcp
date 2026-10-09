@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { jobberGraphQL, jobberGraphQLWrite } from "../jobber/client.js";
+import { registerContactSyncRoutes } from "../contact-sync/http.js";
 import { registerVoiceRoutes } from "../voice/http.js";
 import { VoiceService } from "../voice/service.js";
 import { setCookie, getCookie, deleteCookie } from "hono/cookie";
@@ -192,6 +193,15 @@ if (process.env.JOBBER_VOICE_ENABLED === "true") {
   setInterval(()=>{void sessionStorage.run(context,()=>service.tick()).catch(()=>{});},1000).unref();
   const refresh=()=>{void sessionStorage.run(context,()=>service.directory.refresh()).catch(()=>{});};
   refresh(); setInterval(refresh,5*60*1000).unref();
+}
+
+if (process.env.JOBBER_CONTACT_SYNC_ENABLED === "true") {
+  if (!process.env.JOBBER_STATE_DIR) throw new Error("Contact sync requires persistent Jobber OAuth state");
+  const record = { tokens: null, accountId: undefined, refreshInFlight: null } as SessionRecord;
+  const context = buildSessionContext(record, "contact-sync-service");
+  registerContactSyncRoutes(app,
+    (query, variables, maxCost) => sessionStorage.run(context, () => jobberGraphQL(query, variables, maxCost)),
+    process.env.JOBBER_CONTACT_SYNC_API_KEY || "", process.env.JOBBER_CONTACT_SYNC_ACCOUNT_ID || "");
 }
 
 app.get("/health", (c) => c.json({ ok: true }));
