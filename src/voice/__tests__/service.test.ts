@@ -21,6 +21,7 @@ function fixture(existing = true) {
  const run = vi.fn(async (query: string, vars: any = {}) => {
   if (query.includes("VoiceAccount")) return { account: { id: "williams" } };
   if (query.includes("VoiceClients(")) return { clients: conn(cs) };
+  if (query.includes("VoiceCensusClients")) return {clients:conn(cs.map(c=>({...c,contacts:conn(c.contacts || [])})))};
   if (query.includes("VoiceClient(")) return { client: cs.find(c => c.id === vars.id) };
   if ((query.includes("VoiceContacts") || query.includes("VoiceContactEmails"))) return { client: { contacts: conn([]) } };
   if (query.includes("VoiceClientRequests")) return { client: { requests: conn(requests) } };
@@ -139,8 +140,8 @@ describe("voice status and reconciliation", () => {
   expect((await f.service.execute({action:"resolve",call_id:"call1",caller_number:"+17055550102"})).phone_match).toBe("matched");
  });
  it("blocks new clients when linked contact email is a duplicate",async()=>{
-  const f=fixture(),original=f.run.getMockImplementation()!;
-  f.run.mockImplementation(async(q,v)=>q.includes("VoiceContactEmails")?{client:{contacts:conn([{id:"contact",name:"Other",emails:conn([{address:"alex@example.test"}])}])}}:q.includes("VoiceMoreContactEmails")?{client:{contacts:{nodes:[{id:"contact",emails:conn([{address:"alex@example.test"}])}]}}}:original(q,v));
+  const f=fixture();
+  f.cs[0].contacts=[{id:"contact",name:"Other",phones:conn([]),properties:conn([]),emails:conn([{address:"alex@example.test"}])}];
   const r=await f.service.execute({...input(),intake:{...intake,email:"alex@example.test"}});
   expect(r.outcome).toBe("failed");expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);
  });
@@ -336,15 +337,41 @@ it("retains uncertainty for top-level execution errors merged into mutation data
 
 
 describe("revision-bound preflight and recovery",()=>{
- it("suggests a unique authorized address/name among shared-number clients",async()=>{
+ it("invalidates cached preflight choices when their phone authorization is removed",async()=>{
+  const f=fixture();f.journal.addDirectoryPhone("williams","gen","+17055550100","c1");f.journal.publishDirectory("williams","gen");
+  const args={action:"preflight",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID(),intake};
+  expect((await f.service.dispatch(args)).choices[0].name).toBe("Jane Doe");f.cs[0].phones=[];
+  const r=await f.service.dispatch({action:"operation_status",call_id:args.call_id,caller_number:args.caller_number,operation_id:args.operation_id});
+  expect(r).toMatchObject({outcome:"failed",reason_code:"authorization_changed",next_action:"staff_review",preflight_state:"staff_review",choices:[]});expect(JSON.stringify(r)).not.toContain("Jane Doe");expect(JSON.stringify(f.journal.get(args.operation_id,args.call_id))).not.toContain("1 Main");
+ });
+ it("invalidates a ready receipt if the selected property is removed before a later disclosure",async()=>{
+  const f=fixture();const args={action:"preflight",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID(),intake:{...intake,client_id:"c1",property_id:"p1",street1:"1 Main"}};
+  expect((await f.service.dispatch(args)).preflight_state).toBe("ready");f.cs[0].properties=[];
+  const r=await f.service.dispatch(args);expect(r).toMatchObject({outcome:"failed",reason_code:"authorization_changed"});expect(r.destination).toBeUndefined();
+  const submitted=await f.service.dispatch({...input(),caller_number:args.caller_number,workflow_version:2,preflight_id:args.operation_id,intake:args.intake});expect(submitted.reason_code).toBe("preflight_changed");expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);
+ });
+ it("offers shared-number selection without scanning unrelated clients, then submits only the explicit destination",async()=>{
+  const f=fixture();f.cs.push({...structuredClone(f.cs[0]),id:"c2",name:"Other",properties:[{id:"p2",street1:"2 Main",street2:"",city:"Englehart"}]});
+  for(const c of f.cs)f.journal.addDirectoryPhone("williams","gen","+17055550100",c.id);f.journal.publishDirectory("williams","gen");
+  const original=f.run.getMockImplementation()!;
+  f.run.mockImplementation(async(q,v)=>{if(q.includes("VoiceClients(") || q.includes("VoiceCensus"))throw Error("Full account scan must not run");return original(q,v)});
+  const args={action:"preflight",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID(),intake:{...intake,callback_number:"+17055550100"}};
+  const r=await f.service.dispatch(args);expect(r).toMatchObject({outcome:"completed",preflight_state:"selection_required",next_action:"select_client"});expect(r.choices).toHaveLength(2);
+  const chosen={...args,operation_id:randomUUID(),intake:{...args.intake,client_id:"c2",property_id:"p2"}};
+  expect((await f.service.dispatch(chosen)).preflight_state).toBe("ready");
+  const written=await f.service.dispatch({...input(),caller_number:args.caller_number,intake:chosen.intake,workflow_version:2,preflight_id:chosen.operation_id});
+  expect(written.outcome).toBe("completed");expect(f.requests[0].client.id).toBe("c2");expect(f.requests[0].property.id).toBe("p2");
+ });
+ it("selects an explicitly confirmed authorized destination among shared-number clients",async()=>{
   const f=fixture();f.cs.push({...structuredClone(f.cs[0]),id:"c2",name:"Alex",properties:[{id:"p2",street1:"2 Main Street",street2:"",city:"Englehart"}]});
-  const pf={action:"preflight",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID(),intake:{...intake,callback_number:"+17055550100",street1:" 2 MAIN st. "}};
+  const pf={action:"preflight",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID(),intake:{...intake,client_id:"c2",callback_number:"+17055550100",street1:" 2 MAIN st. "}};
   const r=await f.service.dispatch(pf);expect(r.preflight_state).toBe("ready");expect(r.destination.client_id).toBe("c2");expect(r.destination.property_id).toBe("p2");
   const submitted=await f.service.dispatch({...input(),caller_number:pf.caller_number,workflow_version:2,preflight_id:pf.operation_id,intake:pf.intake});expect(submitted.outcome).toBe("completed");
   expect(f.run.mock.calls.find(([q])=>q.includes("VoiceCreateRequest"))![1].input.propertyId).toBe("p2");
  });
  it("does not choose the first indistinguishable shared-number record",async()=>{
   const f=fixture();f.cs[0].name="Alex";f.cs.push({...structuredClone(f.cs[0]),id:"c2"});
+  for(const c of f.cs)f.journal.addDirectoryPhone("williams","gen","+17055550100",c.id);f.journal.publishDirectory("williams","gen");
   const r=await f.service.dispatch({action:"preflight",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID(),intake:{...intake,street1:"1 Main"}});
   expect(r.preflight_state).toBe("staff_review");expect(r.reason_code).toBe("indistinguishable_clients");expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);
  });
@@ -370,6 +397,26 @@ describe("revision-bound preflight and recovery",()=>{
   f.cs.push({...structuredClone(client),phones:[],properties:[],name:"Alex"});
   const r=await f.service.dispatch({...input(),workflow_version:2,preflight_id:pf.operation_id});
   expect(r.reason_code).toBe("potential_duplicate");expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);
+ });
+ it("uses a complete recent metadata generation as baseline but catches changed contacts in live pages",async()=>{
+  const f=fixture();f.cs[0].contacts=[];await f.service.directory.refresh();
+  f.run.mockClear();
+  f.cs[0].contacts=[{id:"new-contact",name:"Other",phones:conn([]),properties:conn([]),emails:conn([{address:"alex@example.test"}])}];
+  const r=await f.service.dispatch({action:"preflight",call_id:"call1",caller_number:"+17055550101",operation_id:randomUUID(),intake:{...intake,email:"alex@example.test"}});
+  expect(r).toMatchObject({preflight_state:"staff_review",reason_code:"potential_duplicate"});expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);
+  expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCensusClients"))).toHaveLength(1);
+ });
+ it("does not reuse an old completed census as evidence that a client is new",async()=>{
+  const f=fixture(false);await f.service.directory.refresh();
+  const metadata=f.journal.checkpoint("directory-metadata:williams");metadata.completed_at=Date.now()-300001;f.journal.setCheckpoint("directory-metadata:williams",metadata);f.run.mockClear();
+  const r=await f.service.dispatch({action:"preflight",call_id:"call1",caller_number:"+17055550101",operation_id:randomUUID(),intake});
+  expect(r.preflight_state).toBe("ready");expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCensusClients"))).toHaveLength(2);
+ });
+ it("a read-only preflight interrupted by hangup fails clearly without pretending a selection is needed",async()=>{
+  const f=fixture(false),original=f.run.getMockImplementation()!;
+  f.run.mockImplementation(async(q,v)=>{const r=await original(q,v);if(q.includes("VoiceCensusClients"))f.journal.setCheckpoint("ended-call:call1",{ended_at:Date.now()});return r;});
+  const r=await f.service.dispatch({action:"preflight",call_id:"call1",caller_number:"+17055550101",operation_id:randomUUID(),intake});
+  expect(r).toMatchObject({outcome:"failed",reason_code:"call_ended",next_action:"none"});expect(r.preflight_state).toBeUndefined();
  });
  it("a slow new-client scan cannot block an unrelated authorized note",async()=>{
   const f=fixture();

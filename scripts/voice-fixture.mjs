@@ -14,8 +14,7 @@ const cs=[], requests=[], messages=[];
 let assessment=null;
 const run=async (q,v={})=>{
  if(q.includes("VoiceAccount"))return{account:{id:"fixture-williams"}};
- if(q.includes("VoiceIndexClients("))return{clients:conn(cs)};
- if(q.includes("VoiceIndexContacts("))return{client:{contacts:conn([])}};
+ if(q.includes("VoiceCensusClients("))return{clients:conn(cs.map(c=>({...c,contacts:conn([])})))};
  if(q.includes("VoiceClients("))return{clients:conn(cs)};
  if(q.includes("VoiceClient("))return{client:cs.find(c=>c.id===v.id)};
  if(q.includes("VoiceContacts")||q.includes("VoiceContactEmails"))return{client:{contacts:conn([])}};

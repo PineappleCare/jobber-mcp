@@ -190,8 +190,12 @@ if (process.env.JOBBER_VOICE_ENABLED === "true") {
       query.trim().startsWith("mutation") ? jobberGraphQLWrite(query, variables, maxCost) : jobberGraphQL(query, variables, maxCost)), account);
   registerVoiceRoutes(app, service, key);
   setInterval(()=>{void sessionStorage.run(context,()=>service.tick()).catch(()=>{});},1000).unref();
-  const refresh=()=>{void sessionStorage.run(context,()=>service.directory.refresh()).catch(()=>{});};
-  refresh(); setInterval(refresh,5*60*1000).unref();
+  // Resume saved census pages promptly after transient failure, instead of
+  // pausing an incomplete index for the full five-minute refresh interval.
+  const refresh=()=>{void sessionStorage.run(context,()=>service.directory.refresh()).then(
+    ()=>{setTimeout(refresh,5*60*1000).unref();},
+    ()=>{setTimeout(refresh,15000).unref();});};
+  refresh();
 }
 
 app.get("/health", (c) => c.json({ ok: true }));

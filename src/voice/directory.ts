@@ -1,15 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { JobberAuthenticationError, JobberGraphQLRequestError } from "../jobber/errors.js";
+import { JobberAuthenticationError } from "../jobber/errors.js";
 import type { VoiceJournal } from "./journal.js";
 import type { RunQuery } from "./service.js";
 import { normalizePhone } from "./service.js";
-const pi = `pageInfo{hasNextPage endCursor}`;
-const clients = `query VoiceIndexClients($after:String){clients(first:50,after:$after){nodes{id name companyName updatedAt phones{number} emails{address} properties{id street1 street2 city province postalCode}} ${pi}}}`;
-const contacts = `query VoiceIndexContacts($id:EncodedId!,$after:String){client(id:$id){contacts(first:1,after:$after,filter:{includePropertyContacts:true}){nodes{id name updatedAt emails(first:50){nodes{address} ${pi}} properties(first:50){nodes{id} ${pi}} phones(first:50){nodes{number} ${pi}}} ${pi}}}}`;
-const phones = `query VoiceIndexContactPhones($id:EncodedId!,$after:String){clientContact(id:$id){phones(first:50,after:$after){nodes{number} ${pi}}}}`;
-const emails = `query VoiceIndexContactEmails($id:EncodedId!,$after:String){clientContact(id:$id){emails(first:50,after:$after){nodes{address} ${pi}}}}`;
-const properties = `query VoiceIndexContactProperties($id:EncodedId!,$after:String){clientContact(id:$id){properties(first:50,after:$after){nodes{id} ${pi}}}}`;
-export class DirectoryIncomplete extends Error {}
+import { VoiceCensus } from "./census.js";
+import { readFailureReason } from "./read-failure.js";
+export {DirectoryIncomplete} from "./census.js";
 /** Discovery only. Every candidate must pass fresh authorization before disclosure. */
 export class VoiceDirectory {
   private refreshing?: Promise<void>;
@@ -27,70 +23,33 @@ export class VoiceDirectory {
     try {
       if ((await this.run(`query VoiceAccount{account{id}}`, {}, 1)).account?.id !== this.account) throw new JobberAuthenticationError("Voice Jobber account mismatch");
       const checkpoint=this.journal.checkpoint(key);
-      // Old phone-only builds cannot be published as a complete metadata census.
-      // Keep their previously published index available while a new build runs.
-      const state = checkpoint?.version===2 ? checkpoint : { version:2,started_at:Date.now(),generation: randomUUID(), clients: [], after: null, clientsComplete: false, clientOffset: 0, contactAfter: null };
+      // A rolling upgrade retains the published generation. Its next build uses
+      // batched contacts; incomplete old-format generations are never published.
+      const state = checkpoint?.version===3 ? checkpoint : {version:3,started_at:Date.now(),generation:randomUUID(),clients:[],clientOffset:0};
       this.journal.setCheckpoint(key,state);
-      while (!state.clientsComplete) {
-        stage="clients";
-        // Live requested cost is 755 on the pinned API; reserve above it.
-        const c = (await this.run(clients, { after: state.after }, 800)).clients;
-        this.validate(c, state.after);
-        for (const client of c.nodes) {
-          state.clients.push(client.id);
-          this.journal.addDirectoryRecord(this.account,state.generation,"client",client.id,client.id,{...client,observed_at:Date.now()});
-          for (const p of client.phones) this.add(state.generation, client.id, p.number);
+      const censusKey=`${key}:census:${state.generation}`;
+      stage="census";
+      await new VoiceCensus(this.journal,this.run).scan(censusKey,client=>{
+        const {contacts,...basic}=client;
+        this.journal.addDirectoryRecord(this.account,state.generation,"client",client.id,client.id,{...basic,observed_at:Date.now()});
+        for(const p of client.phones)this.add(state.generation,client.id,p.number);
+        for(const contact of contacts) {
+          this.journal.addDirectoryRecord(this.account,state.generation,"contact",contact.id,client.id,{...contact,observed_at:Date.now()});
+          for(const p of contact.phones)this.add(state.generation,client.id,p.number);
         }
-        state.after = c.pageInfo.endCursor; state.clientsComplete = !c.pageInfo.hasNextPage;
-        this.journal.setCheckpoint(key, state);
-      }
-      while (state.clientOffset < state.clients.length) {
-        const id = state.clients[state.clientOffset];
-        stage="contacts";
-        const c = (await this.run(contacts, { id, after: state.contactAfter }, 800)).client?.contacts;
-        this.validate(c, state.contactAfter);
-        for (const contact of c.nodes) {
-          this.validate(contact.phones, null);
-          const metadata={...contact,observed_at:Date.now()};
-          for(const [field,query] of [["emails",emails],["properties",properties]] as const) {
-            stage=`contact_${field}`;
-            this.validate(contact[field],null);
-            const values=[...contact[field].nodes];let connection=contact[field];
-            while(connection.pageInfo.hasNextPage){const after=connection.pageInfo.endCursor;connection=(await this.run(query,{id:contact.id,after},300)).clientContact?.[field];this.validate(connection,after);values.push(...connection.nodes);}
-            metadata[field]=values;
-          }
-          stage="contact_phones";
-          for (const p of contact.phones.nodes) this.add(state.generation, id, p.number);
-          const phoneValues=[...contact.phones.nodes];
-          let more = contact.phones.pageInfo.hasNextPage, after = contact.phones.pageInfo.endCursor;
-          while (more) {
-            const rest = (await this.run(phones, { id: contact.id, after }, 300)).clientContact?.phones;
-            this.validate(rest, after);
-            phoneValues.push(...rest.nodes);
-            for (const p of rest.nodes) this.add(state.generation, id, p.number);
-            more = rest.pageInfo.hasNextPage; after = rest.pageInfo.endCursor;
-          }
-          metadata.phones=phoneValues;this.journal.addDirectoryRecord(this.account,state.generation,"contact",contact.id,id,metadata);
-        }
-        state.contactAfter = c.pageInfo.endCursor;
-        if (!c.pageInfo.hasNextPage) { state.clientOffset++; state.contactAfter = null; }
-        this.journal.setCheckpoint(key, state);
-      }
-      this.journal.publishDirectory(this.account, state.generation);
+        if(!state.clients.includes(client.id))state.clients.push(client.id);state.clientOffset=state.clients.length;
+        this.journal.setCheckpoint(key,state);
+      });
+      this.journal.publishDirectory(this.account,state.generation);
       this.journal.setCheckpoint(`directory-metadata:${this.account}`,{generation:state.generation,started_at:state.started_at,completed_at:Date.now()});
-      this.journal.deleteCheckpoint(key);
-    } catch (error) {
-      // Only fixed classifications leave this boundary; provider errors can contain PII.
-      const reason=error instanceof JobberAuthenticationError ? "account_or_authentication" : error instanceof DirectoryIncomplete ? "incomplete_response" : error instanceof JobberGraphQLRequestError ? "provider_rejected_read" : "read_unavailable";
-      this.journal.directoryFailure(this.account,{stage,reason_code:reason});
+      this.journal.deleteCheckpoint(key);this.journal.deleteCheckpoint(censusKey);
+    } catch(error) {
+      this.journal.directoryFailure(this.account,{stage,reason_code:readFailureReason(error)});
       throw error;
     }
   }
-  private add(generation: string, id: string, raw: string): void {
-    const phone = normalizePhone(raw);
-    if (phone) this.journal.addDirectoryPhone(this.account, generation, phone, id);
-  }
-  private validate(c: any, after: string | null): void {
-    if (!Array.isArray(c?.nodes) || typeof c.pageInfo?.hasNextPage !== "boolean" || c.pageInfo.hasNextPage && (!c.pageInfo.endCursor || c.pageInfo.endCursor === after)) throw new DirectoryIncomplete("Incomplete phone directory");
+  private add(generation:string,id:string,raw:string):void {
+    const phone=normalizePhone(raw);
+    if(phone)this.journal.addDirectoryPhone(this.account,generation,phone,id);
   }
 }

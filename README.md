@@ -185,8 +185,9 @@ Scheduling preferences remain in the Note. No Jobs, Visits, appointments, prices
 status changes or customer notifications are created by this surface. Optional
 email, single names and incomplete locations are preserved without invented fields.
 
-`GET /voice/v1/health` requires the voice bearer and returns only aggregate
-operation outcome counts. `scripts/voice-fixture.mjs` is a loopback-only fake
+`GET /voice/v1/health` requires the voice bearer and returns aggregate operation
+outcomes and directory refresh progress/failure classifications, without client
+data. `scripts/voice-fixture.mjs` is a loopback-only fake
 Jobber backend for Ermine's opt-in cross-repository test; it isolates all audit and
 OAuth state from the developer's home directory and Keychain. Mock verification
 and schema validation do not replace testing scopes and writes on a Jobber test account.
@@ -222,8 +223,20 @@ are included in refresh health reporting.
 Current Ermine submissions bind a ready preflight to the exact intake revision,
 caller and selected destination. Corrections invalidate readiness. Assessments
 default to false and require explicit on-site intent; propertyless Requests remain
-disabled until their API behavior is verified. Duplicate checks perform two
-timestamped resumable full passes (including contacts independently of client
-updates), with a ten-minute active-work bound. Worker leases, due times and
+disabled until their API behavior is verified. Phone-index candidates are freshly
+authorized and returned for explicit destination selection without a directory
+scan. An index miss stays unresolved; it never establishes a new customer.
+
+Duplicate checks use a complete background generation from the last five minutes
+as a baseline, then perform a fresh, resumable account census before a new-client
+decision. Without that baseline, both passes are fresh. Every pass includes
+property contacts independently of client timestamps. Client pages contain the
+first contact and paginate all overflow contact, phone, email and property
+connections; accounts with zero/one-contact clients no longer need one separate
+HTTP request per client. The pinned API requested cost was measured as 885 for a
+20-client page (900 reserved), with no writes during that measurement. Neither a
+partial census nor a census older than ten minutes permits creation. Transient
+background refresh failures resume after 15 seconds, preserving the last complete
+index and saved progress. Worker leases, due times and
 15-second to five-minute reconciliation backoff protect pending/uncertain writes.
 The staff MCP interface and approval contract remain unchanged.
