@@ -1,25 +1,27 @@
 import { BudgetUnavailableError, RequestRateLimitError } from "../jobber/cost-governor.js";
-import { JobberPermissionError, JobberAuthenticationError, JobberGraphQLRequestError, hasMutationExecutionErrors } from "../jobber/client.js";
+import { JobberPermissionError, JobberAuthenticationError, hasMutationExecutionErrors } from "../jobber/client.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { VoiceDirectory, DirectoryIncomplete } from "./directory.js";
 import { fingerprint } from "./journal.js";
 import { z } from "zod";
+import { addressMatches, normalizedText, normalizedStreet, WorkflowRequired, KeyedGate } from "./workflow.js";
 import type { VoiceJournal, VoiceResult } from "./journal.js";
 import { appendAuditLog } from "../utils/auditLog.js";
 
 export type RunQuery = (query: string, variables?: Record<string, unknown>, maxCost?: number) => Promise<any>;
 const text = z.string().trim().max(10000);
 export const voiceInput = z.object({
-  action: z.enum(["resolve", "status", "prepare", "submit", "message", "operation_status"]),
+  action: z.enum(["resolve", "status", "prepare", "preflight", "submit", "message", "operation_status", "end_call"]),
   call_id: z.string().min(1).max(200), caller_number: z.string().max(80),
   operation_id: z.string().uuid().optional(), record_type: z.enum(["client", "request", "job"]).optional(), record_id: z.string().max(200).optional(),
   confirmed: z.boolean().default(false),
+  workflow_version: z.literal(2).optional(), preflight_id:z.string().uuid().optional(), supersedes_operation_id:z.string().uuid().optional(),
   intake: z.object({
     name: text.default(""), callback_number: text.default(""), company: text.default(""), email: z.union([z.literal(""), z.string().email()]).default(""),
     description: text.default(""), service: text.default(""), street1: text.default(""), street2: text.default(""), city: text.default(""),
     province: text.default(""), postal_code: text.default(""), access: text.default(""), urgency: text.default(""), timing: text.default(""),
-    notes: text.default(""), assessment: z.boolean().default(true), property_id: z.string().max(200).optional(), client_id: z.string().max(200).optional(),
+    notes: text.default(""), assessment: z.boolean().default(false), property_id: z.string().max(200).optional(), client_id: z.string().max(200).optional(),
   }).strict().optional(), message: text.optional(),
 }).strict();
 export type VoiceInput = z.infer<typeof voiceInput>;
@@ -64,7 +66,7 @@ class ValidationRejected extends Permanent {
   constructor(readonly step: string, readonly errors: unknown[]) { super(`Jobber rejected the ${step} input`); }
 }
 function knownLocation(i: NonNullable<VoiceInput["intake"]>): boolean { return !!(i.street1 && i.city && /\d/.test(i.street1)); }
-function sameAddress(p: any, i: NonNullable<VoiceInput["intake"]>): boolean { return !!(i.street1 && i.city && p.street1?.trim().toLowerCase() === i.street1.toLowerCase() && (p.street2 || "").trim().toLowerCase() === i.street2.toLowerCase() && p.city?.trim().toLowerCase() === i.city.toLowerCase()); }
+const sameAddress=addressMatches;
 type Match = { client: any; propertyIds: Set<string> | null };
 function url(record: any): string | undefined {
   try { const u = new URL(record.jobberWebUri); return u.protocol === "https:" && (u.hostname === "secure.getjobber.com" || u.hostname.endsWith(".getjobber.com")) ? u.href : undefined; } catch { return undefined; }
@@ -73,7 +75,7 @@ function ref(record: any): VoiceResult { return { id: record.id, ...(url(record)
 
 export class VoiceService {
   private running = new Set<string>();
-  private writeTail: Promise<void> = Promise.resolve();
+  private gates = new KeyedGate();
   private jobs = new Map<string, Promise<VoiceResult>>();
   private readChecks = new Map<string, { work: Promise<VoiceResult>; expires?: number; timer?: ReturnType<typeof setTimeout> }>();
   private lookupContext = new AsyncLocalStorage<string>();
@@ -81,10 +83,11 @@ export class VoiceService {
   constructor(private journal: VoiceJournal, private run: RunQuery, private accountId: string) { this.directory=new VoiceDirectory(journal,run,accountId); }
   directoryHealth(): Record<string,unknown> {return this.directory.status();}
   inputNeverJournaled(id: unknown): boolean {return typeof id !== "string" || !this.journal.hasOperation(id);}
-  async tick():Promise<void> { for(const op of this.journal.pending()) this.launch(voiceInput.parse(this.journal.input(op.id,op.call))); }
+  async tick():Promise<void> { for(const op of this.journal.pending()) if(!this.jobs.has(op.id))void this.launch(voiceInput.parse(this.journal.input(op.id,op.call))); }
   /** Private HTTP dispatch is always quick; the journal owns unfinished work. */
   async dispatch(raw:unknown):Promise<VoiceResult> {
     const input=voiceInput.parse(raw);
+    if(input.action==="end_call") {if(!this.journal.checkpoint(`ended-call:${input.call_id}`))this.journal.setCheckpoint(`ended-call:${input.call_id}`,{ended_at:Date.now()});return {outcome:"completed",records:{}};}
     if(input.action==="prepare") return this.execute(input);
     if(input.action==="operation_status") {
       if(!input.operation_id)throw new Permanent("operation_id required");
@@ -99,6 +102,7 @@ export class VoiceService {
     if(!input.operation_id) input.operation_id=randomUUID();
     const saved=this.journal.start(input.operation_id,input.call_id,input);
     if(!["pending","uncertain"].includes(saved.outcome))return saved.outcome === "completed" && ["resolve","status"].includes(input.action) ? this.deliverRead(input,saved) : saved;
+    if(saved.retry_at && saved.retry_at>Date.now())return saved;
     const work=this.launch(input);
     let timer:ReturnType<typeof setTimeout>;
     const timeout=new Promise<VoiceResult>(resolve=>{timer=setTimeout(()=>{const result=this.journal.get(input.operation_id!,input.call_id);resolve({...result,...(result.outcome === "pending" && !result.retry_at ? {retry_at:Date.now()+1000}: {})});},2000);});
@@ -114,7 +118,7 @@ export class VoiceService {
     if(!check) {
       const entry: { work: Promise<VoiceResult>; expires?: number; timer?: ReturnType<typeof setTimeout> }={work:Promise.resolve({})};
       this.readChecks.set(id,entry);
-      entry.work=this.reauthorizeRead(input,result).catch(error=>({operation_id:id,outcome:error instanceof Permanent || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError || error instanceof JobberGraphQLRequestError ? "failed":"pending",records:{},reason_code:error instanceof Permanent ? "authorization_changed":"lookup_unavailable",retry_at:Date.now()+1000})).then(value=>{
+      entry.work=this.reauthorizeRead(input,result).catch(error=>({operation_id:id,outcome:error instanceof Permanent || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError ? "failed":"pending",records:{},reason_code:error instanceof Permanent ? "authorization_changed":"lookup_unavailable",retry_at:Date.now()+1000})).then(value=>{
         entry.expires=Date.now()+2000;
         entry.timer=setTimeout(()=>{if(this.readChecks.get(id)===entry)this.readChecks.delete(id);},2000);entry.timer.unref();
         return value;
@@ -158,29 +162,34 @@ export class VoiceService {
   private launch(input:VoiceInput):Promise<VoiceResult> {
     const id=input.operation_id!;
     const old=this.jobs.get(id);if(old)return old;
+    if(!this.journal.claim(id))return Promise.resolve(this.journal.get(id,input.call_id));
+    const heartbeat=setInterval(()=>this.journal.renew(id),30000);heartbeat.unref();
     const task=this.lookupContext.run(id,async()=>{
       let result:VoiceResult;
       try {
         const prior=this.journal.get(id,input.call_id);
         result=prior.outcome==="uncertain" ? await this.execute({action:"operation_status",operation_id:id,call_id:input.call_id,caller_number:input.caller_number}) : await this.execute(input);
       }catch(error){
-        const permanent=error instanceof Permanent || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError || error instanceof JobberGraphQLRequestError;
+        const permanent=error instanceof Permanent || error instanceof WorkflowRequired || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError;
         result=this.journal.get(id,input.call_id);result.outcome=permanent ? "failed":"pending";
-        result.reason_code=permanent ? "validation_or_authorization":"lookup_unavailable";
-        result.retry_at=Date.now()+15000;
+        result.reason_code=error instanceof WorkflowRequired ? error.code:permanent ? "validation_or_authorization":"lookup_unavailable";
+        if(error instanceof WorkflowRequired){result.next_action=error.nextAction;result.choices=error.choices;}
+        result.retry_at=this.journal.retryAt(id);
       }
       result.operation_id=id; this.journal.save(id,result);if(result.outcome==="completed")this.journal.clearScan(id);return result;
-    }).finally(()=>{this.jobs.delete(id);});
+    }).finally(()=>{clearInterval(heartbeat);this.journal.release(id);this.jobs.delete(id);});
     this.jobs.set(id,task);return task;
   }
   private async scan(query:string,variables:Record<string,unknown>):Promise<any> {
-    const id=this.lookupContext.getStore();const memo=/query Voice(?:Clients|Contacts|ContactEmails)\(/.test(query);const key=id && memo ? `scan:${id}:${fingerprint({query,variables})}`:undefined;
-    const saved=key && this.journal.checkpoint(key);if(saved)return saved;
+    const id=this.lookupContext.getStore();
+    if(id) {const original=voiceInput.parse(this.journal.input(id,this.journal.operationCall(id)));if(["resolve","preflight"].includes(original.action) && this.journal.checkpoint(`ended-call:${original.call_id}`))throw new WorkflowRequired("call_ended","none");}
+    const memo=/query Voice(?:Clients|Contacts|ContactEmails)\(/.test(query);const key=id && memo ? `scan:${id}:${fingerprint({query,variables})}`:undefined;
+    const saved=key && this.journal.checkpoint(key);if(saved?.observed_at && Date.now()-saved.observed_at<60000)return saved.data;
     const result=await this.run(query,variables,this.cost(query));
     if(key) {
       const c=result.clients || result.client?.contacts;
       if(!Array.isArray(c?.nodes) || typeof c.pageInfo?.hasNextPage!=="boolean" || c.pageInfo.hasNextPage && (!c.pageInfo.endCursor || c.pageInfo.endCursor===variables.after))throw new DirectoryIncomplete("Incomplete Jobber lookup");
-      this.journal.setCheckpoint(key,result);
+      this.journal.setCheckpoint(key,{observed_at:Date.now(),data:result});
     }
     return result;
   }
@@ -238,7 +247,7 @@ export class VoiceService {
       if (!connection || !Array.isArray(connection.nodes) || typeof connection.pageInfo?.hasNextPage !== "boolean") throw new Error("Incomplete duplicate lookup");
       for (const contact of connection.nodes) {
         const emails = await this.pages(moreContactEmailsQuery, { id: clientId, contactAfter: after }, d => d.client?.contacts?.nodes.find((c: any) => c.id === contact.id)?.emails);
-        if (contact.name?.trim().toLowerCase() === name.toLowerCase() || email && emails.some((e: any) => e.address.toLowerCase() === email.toLowerCase())) duplicate = true;
+        if (normalizedText(contact.name) === normalizedText(name) || email && emails.some((e: any) => e.address.toLowerCase() === email.toLowerCase())) duplicate = true;
       }
       if (!connection.pageInfo.hasNextPage) return duplicate;
       if (!connection.pageInfo.endCursor || connection.pageInfo.endCursor === after) throw new Error("Incomplete duplicate lookup");
@@ -246,15 +255,95 @@ export class VoiceService {
     }
     throw new Error("Incomplete duplicate lookup");
   }
-  private async matches(number: string | null): Promise<Match[]> {
+  private async matches(number: string | null, complete=false): Promise<Match[]> {
     if (!number) return [];
     const matches: Match[] = [];
-    const candidates=this.lookupContext.getStore() ? this.directory.candidates(number):undefined;
-    if(this.lookupContext.getStore() && candidates===undefined) {await this.directory.refresh();}
-    const ids=this.lookupContext.getStore() ? this.directory.candidates(number):undefined;
+    const candidates=!complete && this.lookupContext.getStore() ? this.directory.candidates(number):undefined;
+    if(!complete && this.lookupContext.getStore() && candidates===undefined) {await this.directory.refresh();}
+    const ids=!complete && this.lookupContext.getStore() ? this.directory.candidates(number):undefined;
     if(ids?.length) {for(const id of ids){const c=(await this.run(clientQuery,{id},1500)).client;if(c){const m=await this.lookupContext.run("",()=>this.match(c,number,true));if(m)matches.push(m);}}}
     else {for (const c of await this.clients()) { const m = await this.match(c, number); if (m) matches.push(m); }}
     return matches;
+  }
+  private async destination(input:VoiceInput):Promise<{client?:any;property?:any;match?:Match}> {
+    const i=input.intake;if(!i)throw new WorkflowRequired("missing_intake","collect_details");
+    const number=normalizePhone(input.caller_number);
+    // Discovery through an index never proves uniqueness. Only explicit IDs may
+    // bypass the complete scan, and they still require current phone ownership.
+    let matched:Match[];
+    if(i.client_id)matched=[await this.fresh(number,i.client_id)];
+    else matched=await this.matches(number,true);
+    if(!matched.length) {
+      if(i.property_id)throw new WorkflowRequired("unauthorized_destination","select_property");
+      if(!knownLocation(i))throw new WorkflowRequired("missing_location","collect_location");
+      return {};
+    }
+    const identity=(m:Match)=>[m.client.name,m.client.companyName].some(n=>normalizedText(n)===normalizedText(i.company || i.name));
+    const atAddress=matched.filter(m=>m.client.properties.some((p:any)=>sameAddress(p,i) && this.allowed(m,p.id)) && identity(m));
+    const byName=matched.filter(identity);
+    const selected=i.client_id ? matched[0]:atAddress.length===1 ? atAddress[0]:byName.length===1 ? byName[0]:undefined;
+    const choices=matched.map(m=>({id:m.client.id,name:m.client.name,properties:m.client.properties.filter((p:any)=>this.allowed(m,p.id)).map((p:any)=>({id:p.id,address:[p.street1,p.street2,p.city].filter(Boolean).join(", ")}))}));
+    if(!selected) {
+      const relevant=atAddress.length>1 ? atAddress:byName.length>1 ? byName:matched;
+      const description=(m:Match)=>fingerprint({name:normalizedText(m.client.name),company:normalizedText(m.client.companyName),properties:m.client.properties.filter((p:any)=>this.allowed(m,p.id)).map((p:any)=>[normalizedStreet(p.street1),normalizedText(p.street2),normalizedText(p.city)]).sort()});
+      if(relevant.length>1 && relevant.every(m=>description(m)===description(relevant[0])))throw new WorkflowRequired("indistinguishable_clients","staff_review");
+      throw new WorkflowRequired("client_selection_required","select_client",choices);
+    }
+    const current=await this.fresh(number,selected.client.id), client=current.client;
+    const candidates=client.properties.filter((p:any)=>i.property_id ? p.id===i.property_id:sameAddress(p,i));
+    if(candidates.length>1)throw new WorkflowRequired("property_selection_required","select_property",choices.filter(c=>c.id===client.id));
+    const property=candidates[0];
+    if(i.property_id && !property || property && !this.allowed(current,property.id) || current.propertyIds && !property)throw new WorkflowRequired("unauthorized_property","select_property");
+    if(i.property_id && i.street1 && i.city && !sameAddress(property,i))throw new WorkflowRequired("property_address_changed","confirm_destination");
+    const possible=client.properties.filter((p:any)=>this.allowed(current,p.id) && normalizedStreet(p.street1)===normalizedStreet(i.street1) && normalizedText(p.city)===normalizedText(i.city));
+    if(!property && possible.length)throw new WorkflowRequired("possible_property_duplicate","select_property",choices.filter(c=>c.id===client.id));
+    if(!property && !knownLocation(i))throw new WorkflowRequired("missing_location","collect_location");
+    return {client,property,match:current};
+  }
+  private async preflight(input:VoiceInput):Promise<VoiceResult> {
+    const i=input.intake;
+    const missing=[!i?.name && "name",!normalizePhone(i?.callback_number || "") && "callback_number",!i?.description && "description",!i?.service && "service"].filter(Boolean);
+    const base={outcome:"completed",preflight_id:input.operation_id,intake_fingerprint:fingerprint(i),missing_fields:missing,records:{}};
+    if(missing.length)return {...base,preflight_state:"missing_details",next_action:"collect_details"};
+    try {
+      const selected=await this.destination(input);
+      if(!selected.client)await this.checkDuplicates(input);
+      return {...base,preflight_state:"ready",destination:{...(selected.client ? {client_id:selected.client.id,name:selected.client.name}: {new_client:true,name:i!.company || i!.name}),...(selected.property ? {property_id:selected.property.id,address:[selected.property.street1,selected.property.street2,selected.property.city].filter(Boolean).join(", ")}:{new_property:true,address:[i!.street1,i!.street2,i!.city].filter(Boolean).join(", ")})},next_action:"read_back_and_confirm"};
+    }catch(error){
+      if(!(error instanceof WorkflowRequired))throw error;
+      return {...base,preflight_state:error.nextAction==="staff_review" ? "staff_review":"selection_required",reason_code:error.code,next_action:error.nextAction,choices:error.choices};
+    }
+  }
+  private async checkDuplicates(input:VoiceInput):Promise<void> {
+    const i=input.intake!;
+    const key=`duplicate-work:${input.operation_id}`;
+    // Two resumable discovery passes include linked/property contacts separately;
+    // no assumption that editing a contact bumps its parent client's timestamp.
+    let state=this.journal.checkpoint(key);
+    if(state?.pass>=2)state=undefined;
+    state=state || {generation:randomUUID(),active_ms:0,pass:0,after:null,offset:0,clients:[],complete:false};
+    const started=Date.now();
+    try {
+      if(state.active_ms>=600000)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
+      while(state.pass<2) {
+        while(!state.complete) {
+          const c=(await this.run(clientsQuery,{after:state.after},this.cost(clientsQuery))).clients;
+          if(!Array.isArray(c?.nodes) || typeof c.pageInfo?.hasNextPage!=="boolean" || c.pageInfo.hasNextPage && (!c.pageInfo.endCursor || c.pageInfo.endCursor===state.after))throw new DirectoryIncomplete();
+          state.clients.push(...c.nodes.map((v:any)=>v.id));state.after=c.pageInfo.endCursor;state.complete=!c.pageInfo.hasNextPage;
+          this.journal.setCheckpoint(key,state);
+        }
+        while(state.offset<state.clients.length) {
+          const c=(await this.run(clientQuery,{id:state.clients[state.offset]},this.cost(clientQuery))).client;
+          if(!c)throw new DirectoryIncomplete();
+          const duplicate=c.properties.some((p:any)=>sameAddress(p,i)) || await this.lookupContext.run("",()=>this.duplicateContact(c.id,i.name,i.email)) || await this.match(c,normalizePhone(i.callback_number)!,true) || normalizedText(c.name)===normalizedText(i.company || i.name) || !!i.email && c.emails.some((e:any)=>normalizedText(e.address)===normalizedText(i.email));
+          if(duplicate)throw new WorkflowRequired("potential_duplicate","staff_review");
+          state.offset++;this.journal.setCheckpoint(key,state);
+          if(state.active_ms+Date.now()-started>=600000)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
+        }
+        state.pass++;state.clients=[];state.after=null;state.offset=0;state.complete=false;
+        this.journal.setCheckpoint(key,state);
+      }
+    }finally{state.active_ms+=Date.now()-started;this.journal.setCheckpoint(key,state);}
   }
   private async fresh(number: string | null, clientId: string): Promise<Match> {
     if (!number) throw new Permanent("Caller phone is not matched");
@@ -280,6 +369,8 @@ export class VoiceService {
   }
   async execute(raw: unknown): Promise<VoiceResult> {
     const input = voiceInput.parse(raw);
+    if(["resolve","preflight"].includes(input.action) && this.journal.checkpoint(`ended-call:${input.call_id}`))throw new WorkflowRequired("call_ended","none");
+    if(input.action==="status" && Date.now()-(this.journal.checkpoint(`ended-call:${input.call_id}`)?.ended_at || Date.now())>30000)throw new WorkflowRequired("call_ended","none");
     const account = (await this.run(`query VoiceAccount{account{id}}`, {}, 1)).account;
     if (!this.accountId || account?.id !== this.accountId) throw new Permanent("Voice Jobber account mismatch");
     if (input.action === "operation_status") {
@@ -299,19 +390,29 @@ export class VoiceService {
       return result;
     }
     if (input.action === "resolve") {
-      const matched = await this.matches(normalizePhone(input.caller_number));
-      const records = [];
-      for (const m of matched) {
-        await this.fresh(normalizePhone(input.caller_number),m.client.id);
-        const requests=await this.pages(clientRequests,{id:m.client.id},d=>d.client?.requests);
-        const jobs=await this.pages(clientJobs,{id:m.client.id},d=>d.client?.jobs);
-        const current = await this.fresh(normalizePhone(input.caller_number), m.client.id);
-        records.push({ record_type: "client", ...ref(current.client), name: current.client.name, selectable: !current.propertyIds,
-          properties: current.client.properties.filter((p: any) => this.allowed(current, p.id)).map((p: any) => ({ id: p.id, address: [p.street1,p.street2,p.city].filter(Boolean).join(", ") })),
-          requests: requests.filter(r => this.allowed(current, r.property?.id)).map(r => ({ ...ref(r), title: r.title })),
-          jobs: jobs.filter(r => this.allowed(current, r.property?.id)).map(r => ({ ...ref(r), title: r.title })) });
+      const number=normalizePhone(input.caller_number);
+      const indexed=!!number && !!this.directory.candidates(number)?.length;
+      const matched = await this.matches(number);
+      const records:any[]=[];
+      const progress=()=>({outcome:"pending",phone_match:matched.length ? "matched":"unmatched",discovery_complete:!indexed,ambiguous:matched.length>1,records,history_complete:false});
+      // Publish all authorized basic profiles before querying any job history.
+      for(const m of matched) {
+        const current=await this.fresh(number,m.client.id);
+        records.push({record_type:"client",...ref(current.client),name:current.client.name,selectable:!current.propertyIds,
+          properties:current.client.properties.filter((p:any)=>this.allowed(current,p.id)).map((p:any)=>({id:p.id,address:[p.street1,p.street2,p.city].filter(Boolean).join(", ")})),requests:[],jobs:[],history_complete:false});
+        if(input.operation_id && this.journal.hasOperation(input.operation_id))this.journal.save(input.operation_id,progress());
       }
-      return { outcome: "completed", phone_match: matched.length ? "matched" : "unmatched", records };
+      for(const record of records) {
+        if(this.journal.checkpoint(`ended-call:${input.call_id}`))throw new WorkflowRequired("call_ended","none");
+        const requests=await this.pages(clientRequests,{id:record.id},d=>d.client?.requests);
+        const jobs=await this.pages(clientJobs,{id:record.id},d=>d.client?.jobs);
+        const current=await this.fresh(number,record.id);
+        record.requests=requests.filter(r=>r.client?.id===record.id && this.allowed(current,r.property?.id)).map(r=>({...ref(r),title:r.title?.replace(/ \[voice [0-9a-f-]+\]$/, ""),status:r.requestStatus,appointment:r.assessment ? {mode:r.assessment.startAt ? "timed":"unscheduled",start_at:r.assessment.startAt,end_at:r.assessment.endAt}:null}));
+        record.jobs=jobs.filter(r=>r.client?.id===record.id && this.allowed(current,r.property?.id)).map(r=>({...ref(r),title:r.title,status:r.jobStatus}));
+        record.history_complete=true;
+        if(input.operation_id && this.journal.hasOperation(input.operation_id))this.journal.save(input.operation_id,progress());
+      }
+      return {...progress(),outcome:"completed",history_complete:true};
     }
     if (input.action === "status") { const t = await this.target(input); const record = await this.publicStatus(input.record_type!, t.record); await this.target(input); return { outcome: "completed", phone_match: "matched", record }; }
     if (input.action === "prepare") {
@@ -320,38 +421,43 @@ export class VoiceService {
       const missing = [!i.name && "name", !normalizePhone(i.callback_number) && "callback_number", !i.description && "description", !i.service && "service"].filter(Boolean);
       return { outcome: "draft", missing_fields: missing, location_complete: knownLocation(i) || !!i.property_id, assessment_mode: "unscheduled" };
     }
+    if(input.action === "preflight")return this.preflight(input);
     if (!input.operation_id || !input.confirmed) throw new Error("A confirmed submission and operation_id are required");
     const saved = this.journal.start(input.operation_id, input.call_id, input);
     if (saved.outcome !== "pending" || this.running.has(input.operation_id)) return saved;
     this.running.add(input.operation_id);
-    const previous = this.writeTail;
-    let release!: () => void;
-    this.writeTail = new Promise<void>(resolve => { release = resolve; });
-    await previous;
     try {
+      if(input.supersedes_operation_id && this.journal.hasOperation(input.supersedes_operation_id)) {
+        const prior=this.journal.get(input.supersedes_operation_id,input.call_id);
+        if(prior.outcome!=="failed" || !this.journal.safeToReconfirm(input.supersedes_operation_id))throw new WorkflowRequired("unsafe_reconfirmation","staff_review");
+      }
       for(const step of ["client","property","request","note","assessment"]) {
         const prior=this.journal.step(input.operation_id,step);
         if(prior?.state === "rejected")throw new ValidationRejected(step,prior.record?.validation_errors || []);
       }
       if (input.action === "message") await this.message(input, saved);
       else await this.submit(input, saved);
-      saved.outcome = "completed";
+      saved.outcome = "completed";delete saved.current_step;delete saved.failed_step;delete saved.reason;delete saved.reason_code;delete saved.next_action;delete saved.retry_at;delete saved.safe_to_reconfirm;
     } catch (error) {
-      const permanent=error instanceof Permanent || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError || error instanceof JobberGraphQLRequestError;
-      saved.outcome = error instanceof Uncertain ? "uncertain" : permanent ? (Object.keys(saved.records).length ? "partial" : "failed") : "pending";
-      saved.reason_code = error instanceof ValidationRejected ? "jobber_validation" : error instanceof Uncertain ? "write_uncertain" : permanent ? "validation_or_authorization" : error instanceof DirectoryIncomplete ? "directory_incomplete" : "lookup_unavailable";
+      const permanent=error instanceof Permanent || error instanceof WorkflowRequired || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError;
+      saved.outcome = error instanceof Uncertain ? "uncertain" : permanent ? (!this.journal.safeToReconfirm(input.operation_id) ? "partial" : "failed") : "pending";
+      saved.reason_code = error instanceof WorkflowRequired ? error.code:error instanceof ValidationRejected ? "jobber_validation" : error instanceof Uncertain ? "write_uncertain" : permanent ? "validation_or_authorization" : error instanceof DirectoryIncomplete ? "directory_incomplete" : "lookup_unavailable";
+      if(error instanceof WorkflowRequired){saved.next_action=error.nextAction;saved.choices=error.choices;}
+      saved.failed_step=saved.current_step || "prerequisite_reads";
       if(error instanceof ValidationRejected) {saved.validation_errors=error.errors;saved.failed_step=error.step;}
-      saved.retry_at=Date.now()+15000;
+      saved.safe_to_reconfirm=saved.outcome==="failed" && this.journal.safeToReconfirm(input.operation_id);
+      saved.retry_at=this.journal.retryAt(input.operation_id);
       saved.reason = error instanceof Uncertain ? "Write requires reconciliation; no automatic retry." : saved.outcome==="pending" ? "Jobber read unavailable; confirmed work remains pending." : "Jobber request was not completed; staff review required.";
     } finally {
       try { this.journal.save(input.operation_id, saved); }
-      finally { this.running.delete(input.operation_id); release(); }
+      finally { this.running.delete(input.operation_id);if(saved.outcome==="completed" || saved.safe_to_reconfirm)this.journal.releaseReservations(input.operation_id); }
     }
-    await appendAuditLog({ account_id: this.accountId, service_session_id:"voice-service", tool: `voice_${input.action}`, args: { operation_id: input.operation_id, call_id: input.call_id, reason_code: saved.reason_code, stage: Object.keys(saved.records).at(-1) || "prerequisite_reads" }, outcome: saved.outcome === "completed" ? "success" : "error" });
+    await appendAuditLog({ account_id: this.accountId, service_session_id:"voice-service", tool: `voice_${input.action}`, args: { operation_id: input.operation_id, call_id: input.call_id, reason_code: saved.reason_code, stage: saved.failed_step || Object.keys(saved.records).at(-1) || "prerequisite_reads" }, outcome: saved.outcome === "completed" ? "success" : "error" });
     return saved;
   }
   private async write(input: VoiceInput, result: VoiceResult, step: string, query: string, variables: Record<string, unknown>, payload: string, field: string, verify: (record: any) => Promise<any>): Promise<any> {
     const id = input.operation_id!;
+    result.current_step=step;
     const old = this.journal.step(id, step);
     if(old?.state === "rejected")throw new ValidationRejected(step,old.record?.validation_errors || []);
     if (old?.state === "verified") {
@@ -365,6 +471,11 @@ export class VoiceService {
       if (input.action === "submit" && result.phone_match === "matched" && result.records.client?.id) {
         const m=await this.fresh(normalizePhone(input.caller_number),result.records.client.id);
         if (!this.allowed(m,result.records.property?.id)) throw new Permanent("Property no longer accessible");
+      }
+      if(input.action==="submit" && (step==="note" || step==="assessment")) {
+        const current=(await this.run(requestQuery,{id:result.records.request?.id},1000)).request;
+        if(current?.client?.id!==result.records.client?.id || current?.property?.id!==result.records.property?.id)throw new WorkflowRequired("destination_changed","staff_review");
+        if(result.phone_match==="matched")await this.target({...input,record_type:"request",record_id:current.id});
       }
       if ((await this.run(`query VoiceAccount{account{id}}`, {}, 1)).account?.id !== this.accountId) throw new Permanent("Voice Jobber account mismatch");
       this.journal.dispatched(id, step);
@@ -422,6 +533,11 @@ export class VoiceService {
       const type = input.action === "message" ? input.record_type : "request";
       const parentId = input.action === "message" ? input.record_id : result.records.request?.id;
       const noteStep = this.journal.step(id,"note");
+      if(input.action==="submit" && parentId && (noteStep || this.journal.step(id,"assessment"))) {
+        const actual=(await this.run(requestQuery,{id:parentId},1000)).request;
+        if(actual?.client?.id!==result.records.client?.id || actual?.property?.id!==result.records.property?.id)throw new WorkflowRequired("destination_changed","staff_review");
+        if(result.phone_match==="matched")await this.target({...input,record_type:"request",record_id:parentId});
+      }
       if (type && parentId && noteStep && noteStep.state !== "verified") {
         const found = (await this.pages(notes[type].query,{id:parentId},d=>d[type]?.notes)).filter(n=>n.message===this.noteText(input));
         if (found.length === 1) {this.journal.verified(id,"note",found[0]); result.records.note=ref(found[0]);}
@@ -450,7 +566,15 @@ export class VoiceService {
       if (result.outcome === "uncertain" && ["client","property","request","note","assessment"].every(step => { const prior=this.journal.step(id,step); return !prior || prior.state === "verified"; })) {
         result.outcome="pending"; this.journal.save(id,result);
       }
-    } catch { /* Retain uncertainty when reads cannot prove the entire intended result. */ }
+    } catch(error) {
+      // Changed ownership must remain visible while the original mutation is
+      // reconciled; it is never permission to replay it against another parent.
+      if(error instanceof WorkflowRequired) {
+        result.reason_code=error.code;result.next_action=error.nextAction;
+        result.failed_step=result.current_step || "reconciliation";
+      }
+    }
+    result.retry_at=this.journal.retryAt(id);this.journal.save(id,result);
     return result;
   }
   private noteText(input: VoiceInput): string {
@@ -473,44 +597,70 @@ export class VoiceService {
     await this.note(input, result, input.record_type!, record.id);
   }
   private async submit(input: VoiceInput, result: VoiceResult): Promise<void> {
-    const i = input.intake;
+    let i = input.intake;
     if (!i || !i.name || !i.description || !i.service || !normalizePhone(i.callback_number)) throw new Permanent("Incomplete intake");
+    if(input.workflow_version===2) {
+      if(!input.preflight_id)throw new WorkflowRequired("preflight_required","preflight");
+      const receipt=this.journal.get(input.preflight_id,input.call_id);
+      const prepared=voiceInput.parse(this.journal.input(input.preflight_id,input.call_id));
+      if(prepared.action!=="preflight" || normalizePhone(prepared.caller_number)!==normalizePhone(input.caller_number) || receipt.preflight_state!=="ready" || receipt.intake_fingerprint!==fingerprint(i))throw new WorkflowRequired("preflight_changed","preflight");
+      i={...i,...(receipt.destination.client_id ? {client_id:receipt.destination.client_id}:{}),...(receipt.destination.property_id ? {property_id:receipt.destination.property_id}:{})};
+    }
     const number = normalizePhone(input.caller_number);
     const previouslyDispatched = this.journal.step(input.operation_id!, "client");
-    const matches = previouslyDispatched ? [] : await this.matches(number);
+    const matches = previouslyDispatched ? [] : i.client_id ? [await this.fresh(number,i.client_id)] : await this.matches(number,true);
     let client: any, property: any;
-    if (previouslyDispatched) {
+    if(result.phone_match==="matched" && result.records.client?.id) {
+      const selected=await this.fresh(number,result.records.client.id);
+      client=selected.client;property=client.properties.find((p:any)=>p.id===result.records.property?.id);
+      if(result.records.property && (!property || !this.allowed(selected,property.id)))throw new WorkflowRequired("destination_changed","staff_review");
+    } else if (previouslyDispatched) {
       if (previouslyDispatched.state === "dispatched" || !previouslyDispatched.record?.id) throw new Uncertain();
       client = (await this.run(clientQuery,{id:previouslyDispatched.record.id},1000)).client;
       if (!client || !client.phones.some((p: any) => normalizePhone(p.number) === normalizePhone(i.callback_number))) throw new Uncertain();
     } else if (matches.length) {
-      const selected = i.client_id ? matches.find(m => m.client.id === i.client_id) : matches.length === 1 ? matches[0] : undefined;
-      if (!selected) throw new Permanent("Select client");
+      const destination=await this.destination({...input,intake:i});
+      const selected = matches.find(m=>m.client.id===destination.client?.id);
+      if (!selected) throw new WorkflowRequired("client_selection_required","select_client");
       const m = await this.fresh(number, selected.client.id); client = m.client;
       const candidates = client.properties.filter((p:any)=>i.property_id ? p.id === i.property_id : sameAddress(p,i));
-      if (candidates.length > 1) throw new Permanent("Ambiguous property requires staff review");
+      if (candidates.length > 1) throw new WorkflowRequired("property_selection_required","select_property");
       property = candidates[0];
       if (i.property_id && !property || property && !this.allowed(m, property.id) || m.propertyIds && !property) throw new Permanent("Property not accessible");
     } else {
       if (i.client_id || i.property_id) throw new Permanent("Existing records require a matched calling number");
-      // Include linked contact phones/emails in duplicate checks, even when caller ID differs.
-      for (const c of await this.clients()) {
-        if (c.properties.some((p:any)=>sameAddress(p,i)) || await this.duplicateContact(c.id, i.name, i.email) || await this.match(c, normalizePhone(i.callback_number)! ) || c.name?.trim().toLowerCase() === (i.company || i.name).toLowerCase() || i.email && c.emails.some((e: any) => e.address.toLowerCase() === i.email.toLowerCase())) throw new Permanent("Potential duplicate requires staff review");
-      }
-      client = await this.write(input, result, "client", newClient, { input: { firstName: i.name, ...(i.company ? { companyName: i.company, isCompany: true } : {}), phones: [{ number: normalizePhone(i.callback_number), primary: true, smsAllowed: false }], emails: i.email ? [{ address: i.email, primary: true }] : [], receivesReminders: false, receivesFollowUps: false, receivesQuoteFollowUps: false, receivesInvoiceFollowUps: false, receivesReviewRequests: false } }, "clientCreate", "client", async r => {
+      if(!knownLocation(i))throw new WorkflowRequired("missing_location","collect_location");
+      const censusEpoch=this.journal.checkpoint(`client-creation-epoch:${this.accountId}`)?.value;
+      await this.checkDuplicates({...input,intake:i});
+      client = await this.gates.run("new-client",async()=>{
+        // Another voice operation may have created a client after our last
+        // census read. Repeat discovery outside this gate before any mutation.
+        if(censusEpoch!==this.journal.checkpoint(`client-creation-epoch:${this.accountId}`)?.value)throw new DirectoryIncomplete("Client census changed before creation");
+        const keys=[`phone:${normalizePhone(i!.callback_number)}`,`name:${normalizedText(i!.company || i!.name)}`,`address:${normalizedStreet(i!.street1)}:${normalizedText(i!.street2)}:${normalizedText(i!.city)}`];
+        if(!this.journal.reserve(keys,input.operation_id!))throw new WorkflowRequired("creation_reserved","staff_review");
+        this.journal.setCheckpoint(`client-creation-epoch:${this.accountId}`,{value:randomUUID()});
+      return await this.write(input, result, "client", newClient, { input: { firstName: i.name, ...(i.company ? { companyName: i.company, isCompany: true } : {}), phones: [{ number: normalizePhone(i.callback_number), primary: true, smsAllowed: false }], emails: i.email ? [{ address: i.email, primary: true }] : [], receivesReminders: false, receivesFollowUps: false, receivesQuoteFollowUps: false, receivesInvoiceFollowUps: false, receivesReviewRequests: false } }, "clientCreate", "client", async r => {
         const current = (await this.run(clientQuery, { id: r.id }, 1000)).client;
         return current?.firstName === i.name && !(current.lastName || "") && (current.companyName || "") === i.company && current.phones.some((p: any) => normalizePhone(p.number) === normalizePhone(i.callback_number)) && (!i.email || current.emails.some((e: any) => e.address.toLowerCase() === i.email.toLowerCase())) ? current : null;
       });
+      });
     }
-    result.records.client = ref(client); result.phone_match = matches.length ? "matched" : "unmatched";
+    result.records.client = ref(client); result.phone_match = result.phone_match === "matched" || matches.length ? "matched" : "unmatched";
     if (matches.length) await this.fresh(number,client.id);
     if (!property && knownLocation(i)) {
-      property = await this.write(input, result, "property", newProperty, { id: client.id, input: { properties: [{ address: { street1: i.street1, street2: i.street2, city: i.city, province: i.province || undefined, postalCode: i.postal_code || undefined } }] } }, "propertyCreate", "properties", async r => (await this.run(clientQuery, { id: client.id }, 1000)).client?.properties.find((p: any) => p.id === r.id && p.street1 === i.street1 && (p.street2 || "") === i.street2 && p.city === i.city));
+      property=await this.gates.run(`property:${client.id}`,async()=>{
+        const current=(await this.run(clientQuery,{id:client.id},1500)).client;
+        const found=current?.properties.filter((p:any)=>sameAddress(p,i)) || [];
+        if(found.length>1)throw new WorkflowRequired("property_selection_required","select_property");
+        if(found.length===1)return found[0];
+      return await this.write(input, result, "property", newProperty, { id: client.id, input: { properties: [{ address: { street1: i.street1, street2: i.street2, city: i.city, province: i.province || undefined, postalCode: i.postal_code || undefined } }] } }, "propertyCreate", "properties", async r => (await this.run(clientQuery, { id: client.id }, 1000)).client?.properties.find((p: any) => p.id === r.id && sameAddress(p,i)));
+      });
     }
     if (property) result.records.property = ref(property);
+    if(!property)throw new WorkflowRequired("missing_location","collect_location");
     // A per-operation title marker provides a reconciliation handle without copying private call IDs.
     const title = `${i.service.slice(0,50)}: ${i.description.slice(0,70)} [voice ${input.operation_id}]`;
-    const request = await this.write(input, result, "request", newRequest, { input: { clientId: client.id, propertyId: property?.id, title } }, "requestCreate", "request", async r => {
+    const request = await this.write(input, result, "request", newRequest, { input: { clientId: client.id, propertyId: property.id, title } }, "requestCreate", "request", async r => {
       const current = (await this.run(requestQuery, { id: r.id }, 1000)).request;
       return current?.client.id === client.id && current?.property?.id === property?.id && current?.title === title ? current : null;
     });

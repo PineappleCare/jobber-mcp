@@ -628,6 +628,8 @@ describe("jobberGraphQL - THROTTLED (HTTP 200 body)", () => {
 
   it("handles a fresh stdio governor's very first call landing against an already-drained account", async () => {
     vi.useFakeTimers();
+    // Install the fake clock before constructing the governor's clock callback.
+    resetStdioGovernorForTests();
     // Distinct from the HTTP-session THROTTLED tests above: this is the singleton stdio governor
     // on a brand-new process, with no prior recordCost/assumeDepleted priming - the optimistic
     // default (10000) is all it knows going in, and the real account turns out to already be

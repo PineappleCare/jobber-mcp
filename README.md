@@ -163,8 +163,8 @@ the pinned container runtime supports it. Keep the port on loopback/Tailscale,
 never a public ingress. The voice credential cannot authenticate MCP requests.
 
 `POST /voice/v1/execute` accepts these fixed actions with `call_id` and original
-`caller_number`: `resolve`, `status`, `prepare`, `submit`, `message`, and
-`operation_status`. Ermine supplies identity from signed active inbound call state;
+`caller_number`: `resolve`, `status`, `prepare`, `preflight`, `submit`, `message`,
+`operation_status`, and the server-only `end_call`. Ermine supplies identity from signed active inbound call state;
 this is a trusted service interface, not a browser/customer endpoint. The
 connector verifies the configured account before any action, and again before
 external mutations. It never accepts arbitrary GraphQL or a tenant selector.
@@ -218,3 +218,12 @@ Explicit mutation validation errors with no returned record are stored as
 missing responses and top-level execution errors retain uncertainty. Rejected
 steps survive restarts and are never redispatched. Index account-check failures
 are included in refresh health reporting.
+
+Current Ermine submissions bind a ready preflight to the exact intake revision,
+caller and selected destination. Corrections invalidate readiness. Assessments
+default to false and require explicit on-site intent; propertyless Requests remain
+disabled until their API behavior is verified. Duplicate checks perform two
+timestamped resumable full passes (including contacts independently of client
+updates), with a ten-minute active-work bound. Worker leases, due times and
+15-second to five-minute reconciliation backoff protect pending/uncertain writes.
+The staff MCP interface and approval contract remain unchanged.

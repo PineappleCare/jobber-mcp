@@ -39,7 +39,7 @@ function fixture(existing = true) {
  return { service: new VoiceService(journal, run, "williams"), journal, run, cs, requests, noteRecords };
 }
 afterEach(() => { journals.splice(0).forEach(j => j.close()); dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })); });
-const intake = { name: "Alex", callback_number: "+17055550101", service: "Plumbing", description: "Leaking tap", street1: "2 Main", city: "Englehart", timing: "Friday afternoon" };
+const intake = { name: "Alex", callback_number: "+17055550101", service: "Plumbing", description: "Leaking tap", street1: "2 Main", city: "Englehart", assessment:true, timing: "Friday afternoon" };
 const input = () => ({ action: "submit", call_id: "call1", caller_number: "+17055550101", operation_id: randomUUID(), confirmed: true, intake });
 describe("Williams voice boundary", () => {
  it("normalizes complete numbers and rejects identity guesses", () => {
@@ -92,7 +92,7 @@ describe("durable intake", () => {
  });
  it("keeps a useful request without inventing a property", async () => {
   const f = fixture(false); const result = await f.service.execute({ ...input(), intake: { ...intake, street1: "", city: "" } });
-  expect(result.outcome).toBe("completed"); expect(result.missing_location).toBe(true); expect(result.assessment_mode).toBe("not_created");
+  expect(result.outcome).toBe("failed"); expect(result.reason_code).toBe("missing_location"); expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);
  });
  it("does not create a duplicate when preferred callback belongs to another client", async () => {
   const f = fixture(); const result = await f.service.execute({ ...input(), intake: { ...intake, callback_number: "+17055550100" } });
@@ -171,7 +171,7 @@ it("preserves a multiword name without guessing a surname or country",async()=>{
  const p=f.run.mock.calls.find(([q])=>q.includes("VoiceCreateProperty"))![1];expect(p.input.properties[0].address.country).toBeUndefined();
 });
 it("retains incomplete street identification without creating an assessment",async()=>{
- const f=fixture(false);const r=await f.service.execute({...input(),intake:{...intake,street1:"Main Street"}});expect(r.outcome).toBe("completed");expect(r.missing_location).toBe(true);expect(r.assessment_mode).toBe("not_created");expect(f.run.mock.calls.some(([q])=>q.includes("VoiceCreateProperty"))).toBe(false);
+ const f=fixture(false);const r=await f.service.execute({...input(),intake:{...intake,street1:"Main Street"}});expect(r.outcome).toBe("failed");expect(r.reason_code).toBe("missing_location");expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);expect(f.run.mock.calls.some(([q])=>q.includes("VoiceCreateProperty"))).toBe(false);
 });
 it("requires review for duplicate addresses and ambiguous authorized properties",async()=>{
  const f=fixture();f.cs[0].properties.push({...f.cs[0].properties[0],id:"duplicate-property"});
@@ -181,7 +181,7 @@ it("requires review for duplicate addresses and ambiguous authorized properties"
 
 it("confirmed message must survive stale intake arguments", async()=>{
  const f=fixture();
- const r=await f.service.execute({...input(),caller_number:"+17055550100",intake:{...intake,street1:"1 Main",callback_number:"+17055550100"}});
+ const r=await f.service.execute({...input(),caller_number:"+17055550100",intake:{...intake,client_id:"c1",property_id:"p1",street1:"1 Main",callback_number:"+17055550100"}});
  expect(r.outcome).toBe("completed");
  const result=await f.service.execute({action:"message",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID(),confirmed:true,record_type:"request",record_id:"r1",message:"The new gate code is 4321",intake});
  expect(result.outcome).toBe("completed");
@@ -332,4 +332,71 @@ it("retains uncertainty for top-level execution errors merged into mutation data
   f.run.mockImplementation(async(q,v)=>q.includes("VoiceCreateClient")?{clientCreate:{client:null,userErrors:[{message:"Execution failed",path:["clientCreate"]}]}}:original(q,v));
   const args=input();expect((await f.service.execute(args)).outcome).toBe("uncertain");expect(f.journal.step(args.operation_id,"client")?.state).toBe("dispatched");
  }finally{merged.mockRestore();}
+});
+
+
+describe("revision-bound preflight and recovery",()=>{
+ it("suggests a unique authorized address/name among shared-number clients",async()=>{
+  const f=fixture();f.cs.push({...structuredClone(f.cs[0]),id:"c2",name:"Alex",properties:[{id:"p2",street1:"2 Main Street",street2:"",city:"Englehart"}]});
+  const pf={action:"preflight",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID(),intake:{...intake,callback_number:"+17055550100",street1:" 2 MAIN st. "}};
+  const r=await f.service.dispatch(pf);expect(r.preflight_state).toBe("ready");expect(r.destination.client_id).toBe("c2");expect(r.destination.property_id).toBe("p2");
+  const submitted=await f.service.dispatch({...input(),caller_number:pf.caller_number,workflow_version:2,preflight_id:pf.operation_id,intake:pf.intake});expect(submitted.outcome).toBe("completed");
+  expect(f.run.mock.calls.find(([q])=>q.includes("VoiceCreateRequest"))![1].input.propertyId).toBe("p2");
+ });
+ it("does not choose the first indistinguishable shared-number record",async()=>{
+  const f=fixture();f.cs[0].name="Alex";f.cs.push({...structuredClone(f.cs[0]),id:"c2"});
+  const r=await f.service.dispatch({action:"preflight",call_id:"call1",caller_number:"+17055550100",operation_id:randomUUID(),intake:{...intake,street1:"1 Main"}});
+  expect(r.preflight_state).toBe("staff_review");expect(r.reason_code).toBe("indistinguishable_clients");expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);
+ });
+ it("rejects changed intake under a ready preflight without dispatch",async()=>{
+  const f=fixture(false);const id=randomUUID();await f.service.dispatch({action:"preflight",call_id:"call1",caller_number:"+17055550101",operation_id:id,intake});
+  const r=await f.service.dispatch({...input(),workflow_version:2,preflight_id:id,intake:{...intake,description:"different"}});
+  expect(r.reason_code).toBe("preflight_changed");expect(r.safe_to_reconfirm).toBe(true);expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);
+ });
+ it("requires explicit on-site intent; omission creates no Assessment",async()=>{
+  const f=fixture(false);const noAssessment={...intake};delete (noAssessment as any).assessment;const r=await f.service.execute({...input(),intake:noAssessment});
+  expect(r.outcome).toBe("completed");expect(r.assessment_mode).toBe("not_created");expect(f.run.mock.calls.some(([q])=>q.includes("VoiceCreateAssessment"))).toBe(false);
+ });
+ it("does not append a resumed note or assessment after the Request property moved",async()=>{
+  const f=fixture(false),args=input();const original=f.run.getMockImplementation()!;let fail=true;
+  f.run.mockImplementation(async(q,v)=>{if(q.includes("VoiceRequestNotes") && fail)throw Error("readback lost");return original(q,v)});
+  expect((await f.service.execute(args)).outcome).toBe("uncertain");f.requests[0].property={id:"moved-property"};fail=false;
+  const r=await f.service.execute({action:"operation_status",call_id:args.call_id,caller_number:args.caller_number,operation_id:args.operation_id});
+  expect(r.outcome).toBe("uncertain");expect(f.run.mock.calls.some(([q])=>q.includes("VoiceCreateAssessment"))).toBe(false);
+ });
+ it("completed duplicate scans are refreshed before a later creation decision",async()=>{
+  const f=fixture(false),pf={action:"preflight",call_id:"call1",caller_number:"+17055550101",operation_id:randomUUID(),intake};
+  expect((await f.service.dispatch(pf)).preflight_state).toBe("ready");
+  f.cs.push({...structuredClone(client),phones:[],properties:[],name:"Alex"});
+  const r=await f.service.dispatch({...input(),workflow_version:2,preflight_id:pf.operation_id});
+  expect(r.reason_code).toBe("potential_duplicate");expect(f.run.mock.calls.some(([q])=>q.startsWith("mutation"))).toBe(false);
+ });
+ it("a slow new-client scan cannot block an unrelated authorized note",async()=>{
+  const f=fixture();
+  await f.service.execute({...input(),caller_number:"+17055550100",intake:{...intake,client_id:"c1",property_id:"p1",street1:"1 Main"}});
+  const original=f.run.getMockImplementation()!;let release!:(value:any)=>void;let blocked=false;
+  f.run.mockImplementation(async(q,v)=>{if(q.includes("VoiceClients(") && !blocked){blocked=true;return await new Promise(r=>{release=r})}return original(q,v)});
+  const slow=f.service.execute(input());for(let i=0;i<10&&!release;i++)await Promise.resolve();
+  const note=await f.service.execute({action:"message",call_id:"other",caller_number:"+17055550100",operation_id:randomUUID(),confirmed:true,record_type:"request",record_id:"r1",message:"Call tomorrow"});
+  expect(note.outcome).toBe("completed");release({clients:conn([])});await slow;
+ });
+});
+
+it("serializes the final new-client decision after concurrent discovery",async()=>{
+ const f=fixture(false);
+ const results=await Promise.all([f.service.dispatch(input()),f.service.dispatch({...input(),call_id:"call2"})]);
+ expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCreateClient")).length).toBe(1);
+ expect(results.some(r=>r.outcome==="completed")).toBe(true);
+});
+it("leases exclude in-flight work and retries back off without starving new work",()=>{
+ const f=fixture(false),ids=Array.from({length:12},()=>randomUUID());
+ for(const id of ids)f.journal.start(id,"call",{id});
+ expect(f.journal.claim(ids[0])).toBe(true);expect(f.journal.claim(ids[0])).toBe(false);
+ expect(f.journal.pending().some(o=>o.id===ids[0])).toBe(false);
+ f.journal.release(ids[0]);expect(f.journal.pending()[0].id).toBe(ids[1]);
+ let previous=0;
+ for(let attempt=0;attempt<8;attempt++){
+  f.journal.claim(ids[0]);const delay=f.journal.retryAt(ids[0])-Date.now();f.journal.release(ids[0]);
+  expect(delay).toBeGreaterThanOrEqual(previous-1);expect(delay).toBeLessThanOrEqual(300000);previous=delay;
+ }
 });

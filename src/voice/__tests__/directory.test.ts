@@ -13,8 +13,8 @@ describe("durable directory",()=>{
    if(q.includes("VoiceAccount"))return {account:{id:"williams"}};
    if(q.includes("VoiceIndexClients"))return {clients:conn([{id:"c1",phones:[{number:"7055550100"},{number:"7055550102"}]}])};
    expect(q).toContain("includePropertyContacts:true");
-   if(v.after==="ct1"){if(fail)throw Error("connection lost");return {client:{contacts:conn([{id:"ct2",phones:conn([{number:"7055550104"}])}])}};}
-   return {client:{contacts:conn([{id:"ct1",phones:conn([{number:"7055550103"}])}],true,"ct1")}};
+   if(v.after==="ct1"){if(fail)throw Error("connection lost");return {client:{contacts:conn([{id:"ct2",phones:conn([{number:"7055550104"}]),emails:conn([]),properties:conn([])}])}};}
+   return {client:{contacts:conn([{id:"ct1",phones:conn([{number:"7055550103"}]),emails:conn([]),properties:conn([])}],true,"ct1")}};
   });
   const first=new VoiceService(j,run,"williams");
   await expect(first.directory.refresh()).rejects.toThrow("connection lost");expect(first.directory.candidates("+17055550103")).toBeUndefined();expect(first.directory.status().last_failure_at).not.toBeNull();
@@ -51,9 +51,20 @@ describe("durable directory",()=>{
   });
   j.publishDirectory("williams","empty");const args={action:"resolve",call_id:"call",caller_number:"+17055550100",operation_id:randomUUID()};
   const s=new VoiceService(j,run,"williams");expect((await s.dispatch(args)).outcome).toBe("pending");fail=false;
-  const restarted=new VoiceService(j,run,"williams");expect((await restarted.dispatch(args)).outcome).toBe("completed");
+  const restarted=new VoiceService(j,run,"williams");
+  expect((await restarted.dispatch(args)).outcome).toBe("pending");
+  const clock=vi.spyOn(Date,"now").mockReturnValue(Date.now()+16000);
+  try {expect((await restarted.dispatch(args)).outcome).toBe("completed");}finally{clock.mockRestore();}
   expect(run.mock.calls.filter(([q,v])=>q.includes("VoiceClients")&&!v.after).length).toBe(1);
  });
+});
+
+it("does not extend a call's read deadline on repeated disconnect signals",async()=>{
+ const j=journal(),s=new VoiceService(j,async()=>({}),"williams");
+ await s.dispatch({action:"end_call",call_id:"call",caller_number:"+17055550100"});
+ const ended=j.checkpoint("ended-call:call").ended_at;
+ const clock=vi.spyOn(Date,"now").mockReturnValue(ended+31000);
+ try {await s.dispatch({action:"end_call",call_id:"call",caller_number:"+17055550100"});expect(j.checkpoint("ended-call:call").ended_at).toBe(ended);}finally{clock.mockRestore();}
 });
 
 it("fully indexes more than a thousand clients without doing a full scan for a matched caller",async()=>{

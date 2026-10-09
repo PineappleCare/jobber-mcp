@@ -152,12 +152,13 @@ export class CostGovernor {
         throw new BudgetUnavailableError(Math.ceil(waitMs / 1000));
       }
 
-      await this.sleepFn(waitMs);
-      this.currentlyAvailable = Math.min(
-        this.maximumAvailable,
-        this.currentlyAvailable + (waitMs / 1000) * this.restoreRate
-      );
-      this.lastUpdatedAt = this.now();
+      await this.sleepFn(Math.ceil(waitMs));
+      // A concurrent response may have refreshed the budget while we slept.
+      // Credit only time since that response, then admit against the real budget.
+      this.applyElapsedRefill();
+      if (this.currentlyAvailable < maxCost) {
+        throw new BudgetUnavailableError(Math.max(1, Math.ceil(this.backoffMsFor(maxCost) / 1000)));
+      }
     }
 
     this.currentlyAvailable -= maxCost;
