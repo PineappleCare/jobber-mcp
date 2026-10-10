@@ -10,14 +10,18 @@ import { z } from "zod";
 import { addressMatches, normalizedText, normalizedStreet, WorkflowRequired, KeyedGate } from "./workflow.js";
 import type { VoiceJournal, VoiceResult } from "./journal.js";
 import { appendAuditLog } from "../utils/auditLog.js";
+import { appointment, contactDetails, customerStatus, serviceAddress } from "./customer.js";
 
 export type RunQuery = (query: string, variables?: Record<string, unknown>, maxCost?: number) => Promise<any>;
 const text = z.string().trim().max(10000);
 export const voiceInput = z.object({
-  action: z.enum(["resolve", "status", "prepare", "preflight", "submit", "message", "operation_status", "end_call"]),
+  action: z.enum(["resolve", "status", "prepare", "preflight", "submit", "message", "email_prepare", "contact_email", "operation_status", "end_call"]),
   call_id: z.string().min(1).max(200), caller_number: z.string().max(80),
   operation_id: z.string().uuid().optional(), record_type: z.enum(["client", "request", "job"]).optional(), record_id: z.string().max(200).optional(),
   confirmed: z.boolean().default(false),
+  include_history:z.boolean().default(false),
+  email_update:z.object({client_id:z.string().min(1).max(200),contact_id:z.string().min(1).max(200).optional(),address:z.string().email().max(320),make_primary:z.boolean().default(false),intended_use:z.enum(["contact","invoices"]).default("contact")}).strict().optional(),
+  email_fingerprint:z.string().length(64).optional(),
   workflow_version: z.literal(2).optional(), preflight_id:z.string().uuid().optional(), supersedes_operation_id:z.string().uuid().optional(),
   intake: z.object({
     name: text.default(""), callback_number: text.default(""), company: text.default(""), email: z.union([z.literal(""), z.string().email()]).default(""),
@@ -38,23 +42,26 @@ export function normalizePhone(value: string): string | null {
 }
 const pageInfo = `pageInfo{hasNextPage endCursor}`;
 const properties = `properties{id name street1 street2 city province postalCode country jobberWebUri}`;
-const clientBasic = `id name firstName lastName companyName jobberWebUri phones{number} emails{address} ${properties}`;
+const clientBasic = `id name firstName lastName companyName jobberWebUri phones{id number primary contact{id}} emails{id address primary contact{id}} ${properties}`;
 const clientsQuery = `query VoiceClients($after:String){clients(first:10,after:$after){nodes{${clientBasic}} ${pageInfo}}}`;
 const clientQuery = `query VoiceClient($id:EncodedId!){client(id:$id){${clientBasic}}}`;
-const contactsQuery = `query VoiceContacts($id:EncodedId!,$after:String){client(id:$id){contacts(first:1,after:$after,filter:{includePropertyContacts:true}){nodes{id properties(first:50){nodes{id} ${pageInfo}} phones(first:50){nodes{number} ${pageInfo}}} ${pageInfo}}}}`;
+const contactsQuery = `query VoiceContacts($id:EncodedId!,$after:String){client(id:$id){contacts(first:1,after:$after,filter:{includePropertyContacts:true}){nodes{id name emails(first:50){nodes{id address primary} ${pageInfo}} properties(first:50){nodes{id} ${pageInfo}} phones(first:50){nodes{id number primary} ${pageInfo}}} ${pageInfo}}}}`;
 const contactQuery = `query VoiceContact($id:EncodedId!,$contactAfter:String,$after:String){client(id:$id){contacts(first:1,after:$contactAfter,filter:{includePropertyContacts:true}){nodes{id phones(first:50,after:$after){nodes{number} ${pageInfo}}}}}}`;
 const contactPropertiesQuery = `query VoiceContactProperties($id:EncodedId!,$contactAfter:String,$after:String){client(id:$id){contacts(first:1,after:$contactAfter,filter:{includePropertyContacts:true}){nodes{id properties(first:50,after:$after){nodes{id} ${pageInfo}}}}}}`;
-const requestFields = `id title requestStatus jobberWebUri client{id} property{id} assessment{id instructions startAt endAt assignedUsers(first:20){nodes{id} ${pageInfo}}}`;
+const emailContacts = `query VoiceEmailContacts($id:EncodedId!,$after:String){client(id:$id){contacts(first:20,after:$after,filter:{includePropertyContacts:true}){nodes{id name isBillingContact emails(first:50){nodes{id address primary} ${pageInfo}}} ${pageInfo}}}}`;
+const emailContactPage = `query VoiceEmailContactPage($id:EncodedId!,$contactAfter:String,$after:String){client(id:$id){contacts(first:20,after:$contactAfter,filter:{includePropertyContacts:true}){nodes{id emails(first:50,after:$after){nodes{id address primary} ${pageInfo}}}}}}`;
+const requestFields = `id title requestStatus jobberWebUri arrivalWindow{startAt endAt} client{id} property{id} assessment{id instructions startAt endAt allDay isComplete completedAt client{id} property{id} request{id} assignedUsers(first:20){nodes{id} ${pageInfo}}}`;
 const requestQuery = `query VoiceRequest($id:EncodedId!){request(id:$id){${requestFields}}}`;
 const jobFields = `id title jobStatus jobberWebUri client{id} property{id}`;
 const jobQuery = `query VoiceJob($id:EncodedId!){job(id:$id){${jobFields}}}`;
-const visitsQuery = `query VoiceVisits($id:EncodedId!,$after:String){job(id:$id){visits(first:50,after:$after){nodes{id startAt endAt allDay arrivalWindow{duration startAt endAt}} ${pageInfo}}}}`;
+const visitsQuery = `query VoiceVisits($id:EncodedId!,$after:String){job(id:$id){visits(first:50,after:$after){nodes{id startAt endAt allDay isComplete completedAt visitStatus(timezone:"America/Toronto") client{id} property{id} job{id} arrivalWindow{startAt endAt}} ${pageInfo}}}}`;
 const clientRequests = `query VoiceClientRequests($id:EncodedId!,$after:String){client(id:$id){requests(first:50,after:$after){nodes{${requestFields}} ${pageInfo}}}}`;
 const clientJobs = `query VoiceClientJobs($id:EncodedId!,$after:String){client(id:$id){jobs(first:50,after:$after){nodes{${jobFields}} ${pageInfo}}}}`;
 const newClient = `mutation VoiceCreateClient($input:ClientCreateInput!){clientCreate(input:$input){client{${clientBasic}} userErrors{message path}}}`;
 const newProperty = `mutation VoiceCreateProperty($id:EncodedId!,$input:PropertyCreateInput!){propertyCreate(clientId:$id,input:$input){properties{id name street1 street2 city province postalCode country jobberWebUri} userErrors{message path}}}`;
 const newRequest = `mutation VoiceCreateRequest($input:RequestCreateInput!){requestCreate(input:$input){request{${requestFields}} userErrors{message path}}}`;
 const newAssessment = `mutation VoiceCreateAssessment($id:EncodedId!,$input:AssessmentCreateInput!){assessmentCreate(requestId:$id,input:$input){assessment{id instructions startAt endAt request{id} assignedUsers(first:20){nodes{id} ${pageInfo}}} userErrors{message path}}}`;
+const editEmail = `mutation VoiceEditEmail($id:EncodedId!,$input:ClientEditInput!){clientEdit(clientId:$id,input:$input){client{${clientBasic}} userErrors{message path}}}`;
 const notes = {
   client: { query: `query VoiceClientNotes($id:EncodedId!,$after:String){client(id:$id){notes(first:50,after:$after){nodes{id message} ${pageInfo}}}}`, mutation: `mutation VoiceClientNote($id:EncodedId!,$input:ClientCreateNoteInput!){clientCreateNote(clientId:$id,input:$input){clientNote{id message} userErrors{message path}}}`, payload: "clientCreateNote", field: "clientNote" },
   request: { query: `query VoiceRequestNotes($id:EncodedId!,$after:String){request(id:$id){notes(first:50,after:$after){nodes{... on NoteInterface{id message}} ${pageInfo}}}}`, mutation: `mutation VoiceRequestNote($id:EncodedId!,$input:RequestCreateNoteInput!){requestCreateNote(requestId:$id,input:$input){requestNote{id message} userErrors{message path}}}`, payload: "requestCreateNote", field: "requestNote" },
@@ -67,7 +74,7 @@ class ValidationRejected extends Permanent {
 }
 function knownLocation(i: NonNullable<VoiceInput["intake"]>): boolean { return !!(i.street1 && i.city && /\d/.test(i.street1)); }
 const sameAddress=addressMatches;
-type Match = { client: any; propertyIds: Set<string> | null };
+type Match = { client: any; propertyIds: Set<string> | null; direct:boolean; contactIds:Set<string>; contacts:any[] };
 function url(record: any): string | undefined {
   try { const u = new URL(record.jobberWebUri); return u.protocol === "https:" && (u.hostname === "secure.getjobber.com" || u.hostname.endsWith(".getjobber.com")) ? u.href : undefined; } catch { return undefined; }
 }
@@ -93,7 +100,7 @@ export class VoiceService {
       if(!input.operation_id)throw new Permanent("operation_id required");
       let result:VoiceResult;try{result=this.journal.get(input.operation_id,input.call_id);}catch{return {outcome:"not_found",operation_id:input.operation_id};}
       const original=voiceInput.parse(this.journal.input(input.operation_id,input.call_id));
-      if(result.outcome==="completed" && ["resolve","status","preflight"].includes(original.action)) {
+      if(result.outcome==="completed" && ["resolve","status","preflight","email_prepare"].includes(original.action)) {
         return this.deliverRead(original, result);
       }
       if(["pending","uncertain"].includes(result.outcome) && (!result.retry_at || result.retry_at<=Date.now())) this.launch(voiceInput.parse(this.journal.input(input.operation_id,input.call_id)));
@@ -101,7 +108,7 @@ export class VoiceService {
     }
     if(!input.operation_id) input.operation_id=randomUUID();
     const saved=this.journal.start(input.operation_id,input.call_id,input);
-    if(!["pending","uncertain"].includes(saved.outcome))return saved.outcome === "completed" && ["resolve","status","preflight"].includes(input.action) ? this.deliverRead(input,saved) : saved;
+    if(!["pending","uncertain"].includes(saved.outcome))return saved.outcome === "completed" && ["resolve","status","preflight","email_prepare"].includes(input.action) ? this.deliverRead(input,saved) : saved;
     if(saved.retry_at && saved.retry_at>Date.now())return saved;
     const work=this.launch(input);
     let timer:ReturnType<typeof setTimeout>;
@@ -144,7 +151,10 @@ export class VoiceService {
     } finally {clearTimeout(timer!);}
   }
   private async reauthorizeRead(input: VoiceInput, result: VoiceResult): Promise<VoiceResult> {
+    if(input.action!=="status" && this.journal.checkpoint(`ended-call:${input.call_id}`))throw new Permanent("Call ended");
+    if(input.action==="status" && Date.now()-(this.journal.checkpoint(`ended-call:${input.call_id}`)?.ended_at || Date.now())>30000)throw new Permanent("Call ended");
     if((await this.run(`query VoiceAccount{account{id}}`,{},1)).account?.id!==this.accountId)throw new Permanent("Voice Jobber account mismatch");
+    if(input.action==="email_prepare")return this.prepareEmail(input);
     if(input.action==="preflight") {
       const number=normalizePhone(input.caller_number);
       if(result.destination?.client_id) {
@@ -164,8 +174,9 @@ export class VoiceService {
     }
     if(input.action === "status") {
       const target=await this.target(input);
-      const record=await this.publicStatus(input.record_type!,target.record);
-      await this.target(input);
+      const record=await this.publicStatus(input.record_type!,target.record,target.match,input.include_history);
+      const current=await this.target(input);
+      if(this.accessScope(target.match)!==this.accessScope(current.match))throw new Permanent("Phone access changed during disclosure");
       return {...result,record};
     }
     const records=[];
@@ -179,7 +190,7 @@ export class VoiceService {
         }
       }
       const current=await this.fresh(normalizePhone(input.caller_number),prior.id);
-      records.push({record_type:"client",...ref(current.client),name:current.client.name,selectable:!current.propertyIds,
+      records.push({record_type:"client",...ref(current.client),name:current.client.name,selectable:!current.propertyIds,customer:this.customer(current),
         properties:current.client.properties.filter((p:any)=>this.allowed(current,p.id)).map((p:any)=>({id:p.id,address:[p.street1,p.street2,p.city].filter(Boolean).join(", ")})),
         requests:requests.filter(r=>this.allowed(current,r.property?.id)).map(r=>({...ref(r),title:r.title})),
         jobs:jobs.filter(r=>this.allowed(current,r.property?.id)).map(r=>({...ref(r),title:r.title}))});
@@ -205,7 +216,7 @@ export class VoiceService {
         result.retry_at=this.journal.retryAt(id);
       }
       result.operation_id=id; this.journal.save(id,result);if(result.outcome==="completed")this.journal.clearScan(id);
-      if(["preflight","resolve","status"].includes(input.action))await appendAuditLog({account_id:this.accountId,service_session_id:"voice-service",tool:`voice_${input.action}`,args:{operation_id:id,call_id:input.call_id,reason_code:result.reason_code,stage:result.failed_step || result.preflight_state || "complete"},outcome:result.outcome==="completed" ? "success":"error"});
+      if(["preflight","resolve","status","email_prepare"].includes(input.action))await appendAuditLog({account_id:this.accountId,service_session_id:"voice-service",tool:`voice_${input.action}`,args:{operation_id:id,call_id:input.call_id,reason_code:result.reason_code,stage:result.failed_step || result.preflight_state || "complete"},outcome:result.outcome==="completed" ? "success":"error"});
       return result;
     }).finally(()=>{clearInterval(heartbeat);this.journal.release(id);this.jobs.delete(id);});
     this.jobs.set(id,task);return task;
@@ -245,8 +256,9 @@ export class VoiceService {
   }
   private async clients(): Promise<any[]> { return this.pages(clientsQuery, {}, d => d.clients); }
   private async match(client: any, number: string, fresh=false): Promise<Match | null> {
-    if (client.phones.some((p: any) => normalizePhone(p.number) === number)) return { client, propertyIds: null };
+    if (client.phones.some((p: any) => !p.contact?.id && normalizePhone(p.number) === number)) return { client, propertyIds: null,direct:true,contactIds:new Set(),contacts:[] };
     const allowed = new Set<string>(); let matched = false, unrestricted = false;
+    const contactIds=new Set<string>(),matchedContacts:any[]=[];
     let after: string | undefined;
     for (let page = 0; page < 200; page++) {
       const connection = (await (fresh ? this.run(contactsQuery,{id:client.id,after},800):this.scan(contactsQuery, { id: client.id, after }))).client?.contacts;
@@ -258,6 +270,7 @@ export class VoiceService {
         const phones = contact.phones.pageInfo.hasNextPage ? await this.pages(contactQuery, variables, d => select(d)?.phones) : contact.phones.nodes;
         if (!phones.some((p: any) => normalizePhone(p.number) === number)) continue;
         matched = true;
+        contactIds.add(contact.id);matchedContacts.push({...contact,phones});
         const ps = contact.properties.pageInfo.hasNextPage ? await this.pages(contactPropertiesQuery, variables, d => select(d)?.properties) : contact.properties.nodes;
         if (!ps.length) unrestricted = true;
         for (const p of ps) allowed.add(p.id);
@@ -267,7 +280,7 @@ export class VoiceService {
       after = connection.pageInfo.endCursor;
     }
     // A contact without property associations is client-wide; explicit associations narrow access.
-    return matched ? { client, propertyIds: unrestricted ? null : allowed } : null;
+    return matched ? { client, propertyIds: unrestricted ? null : allowed,direct:false,contactIds,contacts:matchedContacts } : null;
   }
   private async matches(number: string | null, complete=false): Promise<Match[]> {
     if (!number) return [];
@@ -401,6 +414,9 @@ export class VoiceService {
     return m;
   }
   private allowed(m: Match, propertyId?: string): boolean { return !m.propertyIds || (!!propertyId && m.propertyIds.has(propertyId)); }
+  private accessScope(m:Match):string {
+    return fingerprint({client:m.client.id,direct:m.direct,contacts:[...m.contactIds].sort(),properties:m.propertyIds ? [...m.propertyIds].sort():null});
+  }
   private async target(input: VoiceInput): Promise<{ record: any; match: Match }> {
     if (!input.record_type || !input.record_id) throw new Permanent("Select an authorized record first");
     const type = input.record_type;
@@ -410,14 +426,26 @@ export class VoiceService {
     if (type === "client" && m.propertyIds || type !== "client" && !this.allowed(m, record.property?.id)) throw new Permanent("Record is not accessible");
     return { record, match: m };
   }
-  private async publicStatus(type: string, r: any): Promise<VoiceResult> {
+  private customer(m:Match):VoiceResult {
+    return {name:m.client.name,company:m.client.companyName || "",phone_authority:m.direct ? "client":"contact",contact_details:m.direct ? [contactDetails(m.client,true)]:m.contacts.map(c=>({...contactDetails(c),details_complete:!c.emails?.pageInfo?.hasNextPage})),service_addresses:m.client.properties.filter((p:any)=>this.allowed(m,p.id)).map(serviceAddress)};
+  }
+  private async publicStatus(type: string, r: any, m:Match, history=false): Promise<VoiceResult> {
     const appointments = type === "job" ? await this.pages(visitsQuery, { id: r.id }, d => d.job?.visits) : r.assessment ? [r.assessment] : [];
-    return { record_type: type, ...ref(r), title: type === "client" ? r.name : r.title?.replace(/ \[voice [0-9a-f-]+\]$/, ""), status: r.jobStatus ?? r.requestStatus,
-      timezone: "America/Toronto", appointments: appointments.map((a: any) => ({ mode: !a.startAt && !a.endAt ? "unscheduled" : a.allDay ? "anytime" : "timed", start_at: a.startAt, end_at: a.endAt, arrival_window: a.arrivalWindow })) };
+    // Per-visit membership matters even when the parent job is authorized.
+    const authorized=appointments.filter((a:any)=>a.client?.id===m.client.id && this.allowed(m,a.property?.id) && (type==="job" ? a.job?.id===r.id:a.request?.id===r.id));
+    const schedule=authorized.filter((a:any)=>history || a.isComplete!==true).map((a:any)=>appointment(a,type==="request" ? r.arrivalWindow:undefined)).sort((a,b)=>String(a.start_at || "9999").localeCompare(String(b.start_at || "9999")));
+    const property=m.client.properties.find((p:any)=>p.id===r.property?.id && this.allowed(m,p.id));
+    const customer=this.customer(m);
+    if(type==="client" && m.direct) {
+      const contacts=await this.pages(emailContacts,{id:r.id},d=>d.client?.contacts);
+      customer.linked_contacts=contacts.map(c=>({id:c.id,name:c.name,emails:c.emails?.nodes?.map((e:any)=>({address:e.address,primary:e.primary===true})) || [],details_complete:!c.emails?.pageInfo?.hasNextPage}));
+    }
+    return { record_type: type, ...ref(r), title: type === "client" ? r.name : r.title?.replace(/ \[voice [0-9a-f-]+\]$/, ""), status: customerStatus(r.jobStatus ?? r.requestStatus),customer,service_address:serviceAddress(property),
+      timezone: "America/Toronto", appointments:schedule, schedule_state:schedule.length ? "recorded":appointments.length===0 ? "none_recorded":authorized.length===0 ? "unavailable":"no_upcoming_visits",history_included:history };
   }
   async execute(raw: unknown): Promise<VoiceResult> {
     const input = voiceInput.parse(raw);
-    if(["resolve","preflight"].includes(input.action) && this.journal.checkpoint(`ended-call:${input.call_id}`))throw new WorkflowRequired("call_ended","none");
+    if(["resolve","preflight","email_prepare"].includes(input.action) && this.journal.checkpoint(`ended-call:${input.call_id}`))throw new WorkflowRequired("call_ended","none");
     if(input.action==="status" && Date.now()-(this.journal.checkpoint(`ended-call:${input.call_id}`)?.ended_at || Date.now())>30000)throw new WorkflowRequired("call_ended","none");
     const account = (await this.run(`query VoiceAccount{account{id}}`, {}, 1)).account;
     if (!this.accountId || account?.id !== this.accountId) throw new Permanent("Voice Jobber account mismatch");
@@ -446,7 +474,7 @@ export class VoiceService {
       // Publish all authorized basic profiles before querying any job history.
       for(const m of matched) {
         const current=await this.fresh(number,m.client.id);
-        records.push({record_type:"client",...ref(current.client),name:current.client.name,selectable:!current.propertyIds,
+        records.push({record_type:"client",...ref(current.client),name:current.client.name,selectable:!current.propertyIds,customer:this.customer(current),
           properties:current.client.properties.filter((p:any)=>this.allowed(current,p.id)).map((p:any)=>({id:p.id,address:[p.street1,p.street2,p.city].filter(Boolean).join(", ")})),requests:[],jobs:[],history_complete:false});
         if(input.operation_id && this.journal.hasOperation(input.operation_id))this.journal.save(input.operation_id,progress());
       }
@@ -455,14 +483,14 @@ export class VoiceService {
         const requests=await this.pages(clientRequests,{id:record.id},d=>d.client?.requests);
         const jobs=await this.pages(clientJobs,{id:record.id},d=>d.client?.jobs);
         const current=await this.fresh(number,record.id);
-        record.requests=requests.filter(r=>r.client?.id===record.id && this.allowed(current,r.property?.id)).map(r=>({...ref(r),title:r.title?.replace(/ \[voice [0-9a-f-]+\]$/, ""),status:r.requestStatus,appointment:r.assessment ? {mode:r.assessment.startAt ? "timed":"unscheduled",start_at:r.assessment.startAt,end_at:r.assessment.endAt}:null}));
-        record.jobs=jobs.filter(r=>r.client?.id===record.id && this.allowed(current,r.property?.id)).map(r=>({...ref(r),title:r.title,status:r.jobStatus}));
+        record.requests=requests.filter(r=>r.client?.id===record.id && this.allowed(current,r.property?.id)).map(r=>({...ref(r),title:r.title?.replace(/ \[voice [0-9a-f-]+\]$/, ""),status:customerStatus(r.requestStatus)}));
+        record.jobs=jobs.filter(r=>r.client?.id===record.id && this.allowed(current,r.property?.id)).map(r=>({...ref(r),title:r.title,status:customerStatus(r.jobStatus)}));
         record.history_complete=true;
         if(input.operation_id && this.journal.hasOperation(input.operation_id))this.journal.save(input.operation_id,progress());
       }
       return {...progress(),outcome:"completed",history_complete:true};
     }
-    if (input.action === "status") { const t = await this.target(input); const record = await this.publicStatus(input.record_type!, t.record); await this.target(input); return { outcome: "completed", phone_match: "matched", record }; }
+    if (input.action === "status") { const t = await this.target(input); const record = await this.publicStatus(input.record_type!, t.record,t.match,input.include_history); const current=await this.target(input); if(this.accessScope(t.match)!==this.accessScope(current.match))throw new Permanent("Phone access changed during disclosure"); return { outcome: "completed", phone_match: "matched", record }; }
     if (input.action === "prepare") {
       const i = input.intake;
       if (!i) throw new Permanent("intake is required");
@@ -470,6 +498,7 @@ export class VoiceService {
       return { outcome: "draft", missing_fields: missing, location_complete: knownLocation(i) || !!i.property_id, assessment_mode: "unscheduled" };
     }
     if(input.action === "preflight")return this.preflight(input);
+    if(input.action === "email_prepare")return this.prepareEmail(input);
     if (!input.operation_id || !input.confirmed) throw new Error("A confirmed submission and operation_id are required");
     const saved = this.journal.start(input.operation_id, input.call_id, input);
     if (saved.outcome !== "pending" || this.running.has(input.operation_id)) return saved;
@@ -479,11 +508,12 @@ export class VoiceService {
         const prior=this.journal.get(input.supersedes_operation_id,input.call_id);
         if(prior.outcome!=="failed" || !this.journal.safeToReconfirm(input.supersedes_operation_id))throw new WorkflowRequired("unsafe_reconfirmation","staff_review");
       }
-      for(const step of ["client","property","request","note","assessment"]) {
+      for(const step of ["client","property","request","note","assessment","email"]) {
         const prior=this.journal.step(input.operation_id,step);
         if(prior?.state === "rejected")throw new ValidationRejected(step,prior.record?.validation_errors || []);
       }
       if (input.action === "message") await this.message(input, saved);
+      else if(input.action === "contact_email")await this.updateEmail(input,saved);
       else await this.submit(input, saved);
       saved.outcome = "completed";delete saved.current_step;delete saved.failed_step;delete saved.reason;delete saved.reason_code;delete saved.next_action;delete saved.retry_at;delete saved.safe_to_reconfirm;
     } catch (error) {
@@ -516,6 +546,10 @@ export class VoiceService {
     if (old?.state === "dispatched") throw new Uncertain();
     if (!old) {
       if (input.action === "message" && input.record_id) await this.target(input);
+      if(input.action==="contact_email") {
+        const target=await this.emailTarget(input);
+        if(fingerprint(this.emailSnapshot(target))!==input.email_fingerprint)throw new WorkflowRequired("email_changed","prepare_email");
+      }
       if (input.action === "submit" && result.phone_match === "matched" && result.records.client?.id) {
         const m=await this.fresh(normalizePhone(input.caller_number),result.records.client.id);
         if (!this.allowed(m,result.records.property?.id)) throw new Permanent("Property no longer accessible");
@@ -558,6 +592,19 @@ export class VoiceService {
   private async reconcile(input: VoiceInput, result: VoiceResult): Promise<VoiceResult> {
     // Read-only recovery. Never infer that a missing record proves a write did not happen.
     const id = input.operation_id!;
+    if(input.action==="contact_email") {
+      try {
+        const before=this.journal.checkpoint(`email-before:${id}`);
+        const target=await this.emailTarget(input);
+        if(before && this.emailVerified(input,before,target.emails)) {
+          this.journal.verified(id,"email",target.client);
+          this.emailOutcome(input,result,target);
+          result.outcome="completed";delete result.reason;delete result.reason_code;delete result.failed_step;delete result.retry_at;
+        }
+      }catch { /* Keep uncertainty and the original payload; never append blindly. */ }
+      if(result.outcome!=="completed")result.retry_at=this.journal.retryAt(id);
+      this.journal.save(id,result);return result;
+    }
     try {
       const clientStep = this.journal.step(id,"client");
       if (clientStep?.state === "returned" && input.intake) {
@@ -643,6 +690,86 @@ export class VoiceService {
     const { record } = await this.target(input);
     result.phone_match = "matched"; result.records[input.record_type!] = ref(record);
     await this.note(input, result, input.record_type!, record.id);
+  }
+  private async emailTarget(input:VoiceInput):Promise<{client:any;contact?:any;emails:any[]}> {
+    const change=input.email_update;
+    if(!change)throw new Permanent("Email details required");
+    const match=await this.fresh(normalizePhone(input.caller_number),change.client_id);
+    if(!change.contact_id) {
+      if(!match.direct)throw new Permanent("Contact phone cannot change client email");
+      return {client:match.client,emails:match.client.emails.filter((e:any)=>!e.contact?.id)};
+    }
+    if(!match.direct && !match.contactIds.has(change.contact_id))throw new Permanent("Contact phone cannot change another contact");
+    let after:string|undefined;
+    for(let page=0;page<200;page++) {
+      const connection=(await this.run(emailContacts,{id:change.client_id,after},1200)).client?.contacts;
+      if(!connection || !Array.isArray(connection.nodes) || typeof connection.pageInfo?.hasNextPage!=="boolean")throw new DirectoryIncomplete("Incomplete email contact lookup");
+      const contact=connection.nodes.find((c:any)=>c.id===change.contact_id);
+      if(contact) {
+        const emails=contact.emails;
+        if(!Array.isArray(emails?.nodes) || typeof emails.pageInfo?.hasNextPage!=="boolean")throw new DirectoryIncomplete("Incomplete contact email lookup");
+        const all=emails.pageInfo.hasNextPage ? await this.pages(emailContactPage,{id:change.client_id,contactAfter:after},d=>d.client?.contacts.nodes.find((c:any)=>c.id===contact.id)?.emails):emails.nodes;
+        return {client:match.client,contact,emails:all};
+      }
+      if(!connection.pageInfo.hasNextPage)break;
+      if(!connection.pageInfo.endCursor || connection.pageInfo.endCursor===after)throw new DirectoryIncomplete("Incomplete contact lookup");
+      after=connection.pageInfo.endCursor;
+    }
+    throw new Permanent("Contact is not linked to this client");
+  }
+  private emailSnapshot(target:{contact?:any;emails:any[]}):any {
+    return {emails:target.emails.map(e=>({id:e.id,address:e.address,primary:e.primary===true})).sort((a,b)=>String(a.id).localeCompare(String(b.id))),billing_contact:target.contact?.isBillingContact===true};
+  }
+  private async prepareEmail(input:VoiceInput):Promise<VoiceResult> {
+    const target=await this.emailTarget(input),change=input.email_update!;
+    const before=this.emailSnapshot(target);
+    const existing=target.emails.filter(e=>e.address.toLowerCase()===change.address.toLowerCase());
+    if(existing.length>1)throw new WorkflowRequired("duplicate_email","staff_review");
+    return {outcome:"completed",phone_match:"matched",email_fingerprint:fingerprint(before),
+      destination:{client_id:target.client.id,...(target.contact ? {contact_id:target.contact.id}:{}),name:target.contact?.name || target.client.name},
+      email_address:change.address,make_primary:change.make_primary,will_be_primary:change.make_primary || target.emails.length===0 || existing[0]?.primary===true,
+      already_present:existing.length===1,invoice_followup:change.intended_use==="invoices" && (target.contact ? !target.contact.isBillingContact:!(change.make_primary || target.emails.length===0 || existing[0]?.primary)),
+      records:{},next_action:"read_back_and_confirm"};
+  }
+  private emailVerified(input:VoiceInput,before:any,current:any[]):boolean {
+    const change=input.email_update!,found=current.filter(e=>e.address.toLowerCase()===change.address.toLowerCase());
+    if(found.length!==1)return false;
+    if(before.emails.some((old:any)=>!current.some(e=>e.id===old.id && e.address===old.address)))return false;
+    const primary=change.make_primary || before.emails.length===0;
+    if(primary && (!found[0].primary || current.filter(e=>e.primary).length!==1))return false;
+    if(!primary && before.emails.some((old:any)=>current.find(e=>e.id===old.id)?.primary!==old.primary))return false;
+    return true;
+  }
+  private emailOutcome(input:VoiceInput,result:VoiceResult,target:{client:any;contact?:any;emails:any[]}):void {
+    const change=input.email_update!,found=target.emails.find(e=>e.address.toLowerCase()===change.address.toLowerCase());
+    result.phone_match="matched";result.records.client=ref(target.client);
+    result.email_update={address:found.address,primary:found.primary===true,contact_name:target.contact?.name || target.client.name,intended_use:change.intended_use,invoice_followup:change.intended_use==="invoices" && (target.contact ? !target.contact.isBillingContact:!found.primary),invoice_sent:false};
+  }
+  private async updateEmail(input:VoiceInput,result:VoiceResult):Promise<void> {
+    const change=input.email_update;
+    if(!change || !input.email_fingerprint)throw new Permanent("Confirmed email proposal required");
+    await this.gates.run(`email:${change.client_id}:${change.contact_id || "client"}`,async()=>{
+      const id=input.operation_id!,prior=this.journal.step(id,"email");
+      let target=await this.emailTarget(input);
+      let before=this.journal.checkpoint(`email-before:${id}`);
+      if(!prior) {
+        before=this.emailSnapshot(target);
+        if(fingerprint(before)!==input.email_fingerprint)throw new WorkflowRequired("email_changed","prepare_email");
+        this.journal.setCheckpoint(`email-before:${id}`,before);
+      }
+      const existing=before.emails.filter((e:any)=>e.address.toLowerCase()===change.address.toLowerCase());
+      if(existing.length>1)throw new WorkflowRequired("duplicate_email","staff_review");
+      if(!prior && existing.length===1 && (!change.make_primary || existing[0].primary)) {
+        this.emailOutcome(input,result,target);result.email_update.already_present=true;return;
+      }
+      const edit=existing.length ? {emailsToEdit:[{id:existing[0].id,primary:true}]} : {emailsToAdd:[{address:change.address,primary:change.make_primary || before.emails.length===0}]};
+      const fields=change.contact_id ? {contactsToEdit:[{id:change.contact_id,...edit}]}:edit;
+      await this.write(input,result,"email",editEmail,{id:change.client_id,input:fields},"clientEdit","client",async()=>{
+        target=await this.emailTarget(input);
+        return this.emailVerified(input,before,target.emails) ? target.client:null;
+      });
+      this.emailOutcome(input,result,target);
+    });
   }
   private async submit(input: VoiceInput, result: VoiceResult): Promise<void> {
     let i = input.intake;

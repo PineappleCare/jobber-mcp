@@ -164,14 +164,14 @@ never a public ingress. The voice credential cannot authenticate MCP requests.
 
 `POST /voice/v1/execute` accepts these fixed actions with `call_id` and original
 `caller_number`: `resolve`, `status`, `prepare`, `preflight`, `submit`, `message`,
-`operation_status`, and the server-only `end_call`. Ermine supplies identity from signed active inbound call state;
+`email_prepare`, `contact_email`, `operation_status`, and the server-only `end_call`. Ermine supplies identity from signed active inbound call state;
 this is a trusted service interface, not a browser/customer endpoint. The
 connector verifies the configured account before any action, and again before
 external mutations. It never accepts arbitrary GraphQL or a tenant selector.
 See [the Ermine release contract](https://github.com/PineappleCare/ermine/blob/master/docs/WILLIAMS_JOBBER_VOICE.md)
 for the intake shape, deployment order and acceptance procedure.
 
-`submit`/`message` require caller confirmation and a UUID `operation_id`. Bind the
+`submit`/`message`/`contact_email` require caller confirmation and a UUID `operation_id`. Bind the
 ID to the full immutable payload and call. The SQLite journal in
 `JOBBER_STATE_DIR/voice-operations.db` records dispatch before every mutation,
 returned IDs and verified readbacks. Retries return the recorded result. Uncertain
@@ -240,6 +240,25 @@ background refresh failures resume after 15 seconds, preserving the last complet
 index and saved progress. Worker leases, due times and
 15-second to five-minute reconciliation backoff protect pending/uncertain writes.
 The staff MCP interface and approval contract remain unchanged.
+
+Customer status is projected through an allowlist: names and relevant contact
+details, authorized service addresses, titles, reviewed status wording and recorded
+Visit/Assessment timing. Completed visits require `include_history:true`; no
+visit found, unscheduled, date-only and unavailable timing remain distinct. Each
+appointment's own client/property/parent is checked. Contact-owned phone matches
+retain the matched contact IDs and property restrictions rather than granting
+client-wide access. Internal notes, line items and financial states are excluded.
+
+`email_prepare` returns a freshly authorized destination, consequences and a
+fingerprint of the complete current email collection. `contact_email` binds that
+fingerprint to the confirmed immutable proposal: `client_id`, optional `contact_id`,
+`address`, explicit `make_primary`, and `intended_use` (`contact` or `invoices`).
+It appends or promotes through narrowly defined `clientEdit` fields, preserves
+every prior address and verifies readback. Contact-only callers can update only
+their own matched contact. First-email primary behavior is disclosed before
+confirmation. Invoice intent is retained for staff where recipient changes are
+needed; no invoice, billing role, portal, notification or consent is changed.
+An uncertain email write remains journaled for reconciliation, never blind replay.
 
 ## Private contact synchronization API
 

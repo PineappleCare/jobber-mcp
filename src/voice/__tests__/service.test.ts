@@ -122,7 +122,7 @@ describe("durable intake", () => {
 describe("voice status and reconciliation", () => {
  it("returns only customer-facing status and recorded windows", async()=>{
   const f=fixture(),original=f.run.getMockImplementation()!;
-  f.run.mockImplementation(async(q,v)=>q.includes("VoiceJob(")?{job:{id:"j1",title:"Repair",jobStatus:"ACTIVE",client:{id:"c1"},property:{id:"p1"},invoice:{amount:999},notes:[{message:"internal"}],jobberWebUri:"https://secure.getjobber.com/jobs/j1"}}:q.includes("VoiceVisits")?{job:{visits:conn([{startAt:null,endAt:null,instructions:"secret",assignedUsers:conn([{id:"staff"}])}])}}:original(q,v));
+  f.run.mockImplementation(async(q,v)=>q.includes("VoiceJob(")?{job:{id:"j1",title:"Repair",jobStatus:"ACTIVE",client:{id:"c1"},property:{id:"p1"},invoice:{amount:999},notes:[{message:"internal"}],jobberWebUri:"https://secure.getjobber.com/jobs/j1"}}:q.includes("VoiceVisits")?{job:{visits:conn([{id:"v1",client:{id:"c1"},property:{id:"p1"},job:{id:"j1"},startAt:null,endAt:null,instructions:"secret",assignedUsers:conn([{id:"staff"}])}])}}:original(q,v));
   const r=await f.service.execute({action:"status",call_id:"call1",caller_number:"7055550100",record_type:"job",record_id:"j1"});
   expect(r.record.appointments[0].mode).toBe("unscheduled");
   expect(JSON.stringify(r)).not.toMatch(/internal|secret|staff|invoice|999/);
