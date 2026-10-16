@@ -5,8 +5,10 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { VoiceJournal } from "../journal.js";
-import { VoiceService, normalizePhone } from "../service.js";
+import { fingerprint } from "../journal.js";
+import { VoiceService, normalizePhone, voiceInput } from "../service.js";
 import { registerVoiceRoutes } from "../http.js";
+import { JobberApiError } from "../../jobber/errors.js";
 vi.mock("../../utils/auditLog.js", () => ({ appendAuditLog: vi.fn() }));
 const pi = { hasNextPage: false, endCursor: null };
 const conn = (nodes: any[]) => ({ nodes, pageInfo: pi });
@@ -411,6 +413,54 @@ describe("revision-bound preflight and recovery",()=>{
   const metadata=f.journal.checkpoint("directory-metadata:williams");metadata.completed_at=Date.now()-300001;f.journal.setCheckpoint("directory-metadata:williams",metadata);f.run.mockClear();
   const r=await f.service.dispatch({action:"preflight",call_id:"call1",caller_number:"+17055550101",operation_id:randomUUID(),intake});
   expect(r.preflight_state).toBe("ready");expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCensusClients"))).toHaveLength(2);
+ });
+ it("shares only an in-flight census across description corrections and keeps each preflight bound to its intake",async()=>{
+  const f=fixture(false);
+  const earlier={action:"preflight",call_id:"call1",caller_number:"+17055550101",operation_id:randomUUID(),intake};
+  const corrected={...earlier,operation_id:randomUUID(),intake:{...intake,description:"Urgent leaking toilet"}};
+  const [a,b]=await Promise.all([f.service.dispatch(earlier),f.service.dispatch(corrected)]);
+  expect(a).toMatchObject({outcome:"completed",preflight_state:"ready",operation_id:earlier.operation_id,intake_fingerprint:fingerprint(voiceInput.parse(earlier).intake)});
+  expect(b).toMatchObject({outcome:"completed",preflight_state:"ready",operation_id:corrected.operation_id,intake_fingerprint:fingerprint(voiceInput.parse(corrected).intake)});
+  expect(a.intake_fingerprint).not.toBe(b.intake_fingerprint);
+  expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCensusClients"))).toHaveLength(2);
+  // Caller and call boundaries both get a separate fresh census.
+  const third={...earlier,caller_number:"+17055550102",operation_id:randomUUID()};
+  await f.service.dispatch(third);
+  expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCensusClients"))).toHaveLength(4);
+  const fourth={...earlier,call_id:"call2",operation_id:randomUUID()};
+  await f.service.dispatch(fourth);
+  expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCensusClients"))).toHaveLength(6);
+ });
+ it("shares a throttled preflight read, then resumes it for both corrected drafts",async()=>{
+  const f=fixture(false),original=f.run.getMockImplementation()!;
+  let blockFirst=true,signalStarted!:()=>void,releaseFirst!:(value:any)=>void;
+  const started=new Promise<void>(resolve=>{signalStarted=resolve;});
+  const blocked=new Promise<any>(resolve=>{releaseFirst=resolve;});
+  f.run.mockImplementation(async(q,v)=>{
+   if(q.includes("VoiceCensusClients")&&blockFirst){blockFirst=false;signalStarted();await blocked;throw new JobberApiError("Jobber API error: HTTP 429 - throttled");}
+   return original(q,v);
+  });
+  const first={action:"preflight",call_id:"call1",caller_number:"+17055550101",operation_id:randomUUID(),intake};
+  const corrected={...first,operation_id:randomUUID(),intake:{...intake,description:"Urgent leaking toilet"}};
+  const firstDispatch=f.service.dispatch(first);
+  await started;
+  const correctedDispatch=f.service.dispatch(corrected);
+  releaseFirst({});
+  const [a,b]=await Promise.all([firstDispatch,correctedDispatch]);
+  expect(a).toMatchObject({outcome:"pending",reason_code:"provider_throttled"});
+  expect(b).toMatchObject({outcome:"pending",reason_code:"provider_throttled"});
+  expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCensusClients"))).toHaveLength(1);
+  for(const id of [first.operation_id,corrected.operation_id]){
+   const saved=f.journal.get(id,"call1");f.journal.save(id,{...saved,retry_at:Date.now()-1});
+  }
+  await f.service.tick();
+  await vi.waitFor(()=>{
+   expect(f.journal.get(first.operation_id,"call1").outcome).toBe("completed");
+   expect(f.journal.get(corrected.operation_id,"call1").outcome).toBe("completed");
+  });
+  expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCensusClients"))).toHaveLength(3);
+  expect(f.journal.get(first.operation_id,"call1").intake_fingerprint).toBe(fingerprint(voiceInput.parse(first).intake));
+  expect(f.journal.get(corrected.operation_id,"call1").intake_fingerprint).toBe(fingerprint(voiceInput.parse(corrected).intake));
  });
  it("a read-only preflight interrupted by hangup fails clearly without pretending a selection is needed",async()=>{
   const f=fixture(false),original=f.run.getMockImplementation()!;
