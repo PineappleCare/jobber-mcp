@@ -84,6 +84,7 @@ export class VoiceService {
   private running = new Set<string>();
   private gates = new KeyedGate();
   private jobs = new Map<string, Promise<VoiceResult>>();
+  private preflightDuplicateChecks = new Map<string, Promise<void>>();
   private readChecks = new Map<string, { work: Promise<VoiceResult>; expires?: number; timer?: ReturnType<typeof setTimeout> }>();
   private lookupContext = new AsyncLocalStorage<string>();
   readonly directory: VoiceDirectory;
@@ -361,9 +362,27 @@ export class VoiceService {
       return {...base,preflight_state:error.nextAction==="staff_review" ? "staff_review":"selection_required",reason_code:error.code,next_action:error.nextAction,choices:error.choices};
     }
   }
-  private async checkDuplicates(input:VoiceInput):Promise<void> {
+  private checkDuplicates(input:VoiceInput):Promise<void> {
+    if(input.action!=="preflight")return this.scanDuplicates(input,`duplicate-work:${input.operation_id}`);
     const i=input.intake!;
-    const key=`duplicate-work:${input.operation_id}`;
+    // Description and other non-identity corrections create a new immutable
+    // preflight receipt, but they do not change the duplicate predicate. Share
+    // only the in-flight read for this call and exact set of fields it examines.
+    // Submission still performs its own fresh census before any client write.
+    const key=`duplicate-work:preflight:${fingerprint({account:this.accountId,call_id:input.call_id,caller_number:input.caller_number,
+      name:i.name,company:i.company,callback_number:i.callback_number,email:i.email,
+      street1:i.street1,street2:i.street2,city:i.city,province:i.province,postal_code:i.postal_code})}`;
+    let work=this.preflightDuplicateChecks.get(key);
+    if(!work) {
+      work=this.scanDuplicates(input,key).finally(()=>{
+        if(this.preflightDuplicateChecks.get(key)===work)this.preflightDuplicateChecks.delete(key);
+      });
+      this.preflightDuplicateChecks.set(key,work);
+    }
+    return work;
+  }
+  private async scanDuplicates(input:VoiceInput,key:string):Promise<void> {
+    const i=input.intake!;
     // Two discovery passes include linked/property contacts independently. A
     // recent complete background generation can supply the baseline; the final
     // pass always goes to Jobber and never relies on parent updatedAt timestamps.

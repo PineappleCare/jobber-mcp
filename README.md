@@ -239,6 +239,10 @@ partial census nor a census older than ten minutes permits creation. Transient
 background refresh failures resume after 15 seconds, preserving the last complete
 index and saved progress. Worker leases, due times and
 15-second to five-minute reconciliation backoff protect pending/uncertain writes.
+Concurrent preflight reads share an in-flight census only when account, call,
+caller and every field used by the duplicate predicate match. Description-only
+corrections retain separate immutable preflight receipts; submission still runs
+its own fresh census before a client can be created.
 The staff MCP interface and approval contract remain unchanged.
 
 Customer status is projected through an allowlist: names and relevant contact
