@@ -78,6 +78,7 @@ function getSharedAccountGovernor(accountId: string, sessionId: string, seed?: C
     entry = { governor, sessionIds: new Set() };
     accountGovernors.set(accountId, entry);
   }
+  if (seed) entry.governor.seedFrom(seed);
   entry.sessionIds.add(sessionId);
   return entry.governor;
 }
@@ -101,11 +102,11 @@ async function resolveAccountId(ctx: SessionContext, control: AdmissionControl):
     try {
       const { status, body, retryAfterHeader } = await postOnce(token, ACCOUNT_ID_QUERY, undefined, control);
       governor.settleAdmission(admission);
-      if (body?.extensions?.cost) {
-        governor.recordCost(body.extensions.cost);
-      } else if (status === 429 || isThrottled(body)) {
-        governor.assumeDepleted();
-        governor.deferUntil(retryAfterAt(retryAfterHeader));
+      if (body?.extensions?.cost) governor.recordCost(body.extensions.cost, admission);
+      if (status === 429 || isThrottled(body)) {
+        if (!body?.extensions?.cost) governor.assumeDepleted();
+        const throttleWait = body?.extensions?.cost ? Math.max(1000, governor.backoffMsFor(body.extensions.cost.requestedQueryCost)) : DEFAULT_429_BACKOFF_MS[0];
+        governor.deferUntil(retryAfterAt(retryAfterHeader, throttleWait));
       }
       const id = body?.data?.account?.id;
       if (status === 429 || isThrottled(body)) accountResolutionRetryAt.set(ctx.sessionId, governor.getCooldownUntil());
@@ -247,20 +248,24 @@ async function postOnce(
       body: JSON.stringify({ query, variables }),
       signal: request.signal,
     });
+    let body: any = {};
+    let parseFailed = false;
+    try {
+      body = await res.json();
+    } catch (err: any) {
+      if (control.signal?.aborted) throw control.signal.reason ?? err;
+      if (request.signal.aborted) throw new JobberApiError("Jobber API response body timed out or was cancelled.");
+      parseFailed = true;
+    }
+    return { status: res.status, retryAfterHeader: res.headers.get("Retry-After"), body, parseFailed };
   } catch (err: any) {
     if (control.signal?.aborted) throw control.signal.reason ?? err;
+    if (request.signal.aborted) throw new JobberApiError("Jobber API request timed out.");
+    if (err instanceof JobberApiError) throw err;
     throw new JobberApiError(`Jobber API request failed: ${err.message}`);
   } finally {
     request.cleanup();
   }
-  let body: any = {};
-  let parseFailed = false;
-  try {
-    body = await res.json();
-  } catch {
-    parseFailed = true;
-  }
-  return { status: res.status, retryAfterHeader: res.headers.get("Retry-After"), body, parseFailed };
 }
 
 function isThrottled(body: any): boolean {
@@ -330,7 +335,7 @@ async function executeGraphQL<T = any>(
         throw error;
       }
       const { status, retryAfterHeader, body, parseFailed } = response;
-      if (body?.extensions?.cost) governor.recordCost(body.extensions.cost);
+      if (body?.extensions?.cost) governor.recordCost(body.extensions.cost, admission);
 
       if (status === 429) {
         const fallback = DEFAULT_429_BACKOFF_MS[Math.min(rateLimitRetries, DEFAULT_429_BACKOFF_MS.length - 1)];

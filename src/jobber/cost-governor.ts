@@ -224,16 +224,18 @@ export class CostGovernor {
 
   /** Carry the first account-resolution request's observations into the shared account bucket. */
   seedFrom(other: CostGovernor): void {
-    this.restoreRate = other.restoreRate;
+    this.applyElapsedRefill();
+    other.applyElapsedRefill();
+    this.restoreRate = Math.min(this.restoreRate, other.restoreRate);
     this.maximumAvailable = Math.min(this.maximumAvailable, other.maximumAvailable);
-    this.currentlyAvailable = Math.min(this.maximumAvailable, other.currentlyAvailable);
+    this.currentlyAvailable = Math.min(this.currentlyAvailable, other.currentlyAvailable, this.maximumAvailable);
     this.lastUpdatedAt = Math.max(this.lastUpdatedAt, other.lastUpdatedAt);
-    this.requestTimestamps = [...other.requestTimestamps];
+    this.requestTimestamps = [...new Set([...this.requestTimestamps, ...other.requestTimestamps])].sort((a,b)=>a-b);
     this.cooldownUntil = Math.max(this.cooldownUntil, other.cooldownUntil);
   }
 
   /** Updates tracked budget state from a GraphQL response's extensions.cost. Ignores malformed payloads. */
-  recordCost(cost: JobberCostExtension): void {
+  recordCost(cost: JobberCostExtension, responseAdmissionId?: number): void {
     const parsed = CostExtensionSchema.safeParse(cost);
     if (!parsed.success) {
       console.error("[cost-governor] Ignoring malformed extensions.cost from Jobber:", parsed.error.message);
@@ -242,9 +244,12 @@ export class CostGovernor {
     this.applyElapsedRefill();
     // Reservation estimates include every in-flight and completed attempt. Never let an
     // out-of-order provider snapshot raise that conservative estimate; refill does that safely.
+    const siblingReservations = [...this.reservations.entries()]
+      .filter(([id]) => id !== responseAdmissionId)
+      .reduce((total, [, amount]) => total + amount, 0);
     this.currentlyAvailable = Math.min(
       this.currentlyAvailable,
-      parsed.data.throttleStatus.currentlyAvailable,
+      Math.max(0, parsed.data.throttleStatus.currentlyAvailable - siblingReservations),
       parsed.data.throttleStatus.maximumAvailable
     );
     this.restoreRate = parsed.data.throttleStatus.restoreRate;

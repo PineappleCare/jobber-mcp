@@ -79,6 +79,17 @@ describe("Williams voice boundary", () => {
  });
 });
 describe("durable intake", () => {
+ it("lets a confirmed submission finish after hangup once its read-only census has started", async()=>{
+  const f=fixture(false),args=input(),original=f.run.getMockImplementation()!;let release!:(value:any)=>void;let blocked=false;
+  f.run.mockImplementation(async(q,v)=>{if(q.includes("VoiceCensusClients")&&!blocked){blocked=true;return await new Promise(r=>{release=r});}return original(q,v)});
+  const started=await f.service.dispatch(args);
+  await vi.waitFor(()=>expect(blocked).toBe(true));
+  await f.service.dispatch({action:"end_call",call_id:args.call_id,caller_number:args.caller_number});
+  release({clients:conn([])});
+  await vi.waitFor(()=>expect(f.journal.get(args.operation_id!,args.call_id).outcome).toBe("completed"));
+  expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceCreateClient")).length).toBe(1);
+  expect(started.outcome).toBe("pending");
+ });
  it("creates a single-name client, property, request, note and unscheduled assessment", async () => {
   const f = fixture(false), args = input(), result = await f.service.execute(args);
   expect(result.outcome).toBe("completed"); expect(result.assessment_mode).toBe("unscheduled");
@@ -467,6 +478,23 @@ describe("revision-bound preflight and recovery",()=>{
   f.run.mockImplementation(async(q,v)=>{const r=await original(q,v);if(q.includes("VoiceCensusClients"))f.journal.setCheckpoint("ended-call:call1",{ended_at:Date.now()});return r;});
   const r=await f.service.dispatch({action:"preflight",call_id:"call1",caller_number:"+17055550101",operation_id:randomUUID(),intake});
   expect(r).toMatchObject({outcome:"failed",reason_code:"call_ended",next_action:"none"});expect(r.preflight_state).toBeUndefined();
+ });
+ it("persists the scan generation before provider I/O and settles an expired deadline as staff review",async()=>{
+  const f=fixture(false),base=Date.now(),key="duplicate-work:preflight:deadline-probe";vi.useFakeTimers();vi.setSystemTime(base);
+  const calls:string[]=[];const original=f.journal.setCheckpoint.bind(f.journal);vi.spyOn(f.journal,"setCheckpoint").mockImplementation((k,v)=>{calls.push(k);original(k,v)});
+  f.run.mockImplementation(async()=>{expect(f.journal.checkpoint(key)?.generation).toBeTruthy();vi.setSystemTime(base+60000);throw new JobberApiError("request timed out");});
+  try {
+   await expect((f.service as any).scanDuplicates({...input(),action:"preflight"},key)).rejects.toMatchObject({code:"duplicate_check_incomplete",nextAction:"staff_review"});
+   expect(calls[0]).toBe(key);
+   const saved=f.journal.checkpoint(key);expect(saved.generation).toBeTruthy();expect(saved.deadline_at).toBe(base+60000);
+  } finally {vi.useRealTimers();}
+ });
+ it("evicts old completed preflight results when bounding the in-memory reuse cache",async()=>{
+  const f=fixture(false),cache=(f.service as any).preflightDuplicateChecks as Map<string,any>,expiresAt=Date.now()+3600000;
+  for(let i=0;i<130;i++)cache.set(`old-${i}`,{work:Promise.resolve(),expiresAt});
+  await (f.service as any).checkDuplicates({action:"preflight",call_id:"call1",caller_number:"+17055550101",intake},"duplicate-work:preflight:cache-probe");
+  expect(cache.size).toBeLessThanOrEqual(128);
+  expect(cache.has("old-0")).toBe(false);
  });
  it("a slow new-client scan cannot block an unrelated authorized note",async()=>{
   const f=fixture();

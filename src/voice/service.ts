@@ -87,7 +87,7 @@ export class VoiceService {
   private running = new Set<string>();
   private gates = new KeyedGate();
   private jobs = new Map<string, Promise<VoiceResult>>();
-  private preflightDuplicateChecks = new Map<string, { work: Promise<void>; expiresAt?: number }>();
+  private preflightDuplicateChecks = new Map<string, { work: Promise<void>; expiresAt?: number; timer?: ReturnType<typeof setTimeout> }>();
   private callControllers = new Map<string, Set<AbortController>>();
   private readChecks = new Map<string, { work: Promise<VoiceResult>; expires?: number; timer?: ReturnType<typeof setTimeout> }>();
   private lookupContext = new AsyncLocalStorage<string>();
@@ -213,7 +213,7 @@ export class VoiceService {
     const heartbeat=setInterval(()=>this.journal.renew(id),30000);heartbeat.unref();
     const controller=new AbortController();
     const controllers=this.callControllers.get(input.call_id) || new Set<AbortController>();
-    controllers.add(controller);this.callControllers.set(input.call_id,controllers);
+    if(input.action==="preflight") { controllers.add(controller);this.callControllers.set(input.call_id,controllers); }
     const task=this.lookupContext.run(id,async()=>{
       let result:VoiceResult;
       try {
@@ -388,10 +388,16 @@ export class VoiceService {
     let entry=this.preflightDuplicateChecks.get(key);
     if(entry?.expiresAt && entry.expiresAt<=Date.now()){this.preflightDuplicateChecks.delete(key);entry=undefined;}
     if(!entry) {
-      const created:{work:Promise<void>;expiresAt?:number}={work:Promise.resolve()};
+      for(const [oldKey,value] of this.preflightDuplicateChecks)if(value.expiresAt && value.expiresAt<=Date.now()){if(value.timer)clearTimeout(value.timer);this.preflightDuplicateChecks.delete(oldKey);}
+      const completed=[...this.preflightDuplicateChecks.entries()].filter(([,value])=>value.expiresAt).sort((a,b)=>(a[1].expiresAt||0)-(b[1].expiresAt||0));
+      while(completed.length>=128){const [oldKey,value]=completed.shift()!;if(value.timer)clearTimeout(value.timer);this.preflightDuplicateChecks.delete(oldKey);}
+      const created:{work:Promise<void>;expiresAt?:number;timer?:ReturnType<typeof setTimeout>}={work:Promise.resolve()};
       created.work=this.scanDuplicates(input,key).then(()=>{
         created.expiresAt=Date.now()+PREFLIGHT_RESULT_REUSE_MS;
+        created.timer=setTimeout(()=>{if(this.preflightDuplicateChecks.get(key)===created)this.preflightDuplicateChecks.delete(key);},PREFLIGHT_RESULT_REUSE_MS);
+        created.timer.unref?.();
       }).catch(error=>{
+        if(created.timer)clearTimeout(created.timer);
         if(this.preflightDuplicateChecks.get(key)===created)this.preflightDuplicateChecks.delete(key);
         throw error;
       });
@@ -407,13 +413,15 @@ export class VoiceService {
     // pass always goes to Jobber and never relies on parent updatedAt timestamps.
     let state=this.journal.checkpoint(key);
     if(state?.pass>=2)state=undefined;
-    state=state?.version===2 ? state:{version:2,generation:randomUUID(),active_ms:0,pass:0,started_at:Date.now(),deadline_at:Date.now()+PREFLIGHT_SCAN_DEADLINE_MS};
+    const now=Date.now();
+    state=state?.version===2 ? state:{version:2,generation:randomUUID(),active_ms:0,pass:0,started_at:now,deadline_at:now+PREFLIGHT_SCAN_DEADLINE_MS};
     if(!Number.isFinite(state.deadline_at))state.deadline_at=Date.now()+PREFLIGHT_SCAN_DEADLINE_MS;
+    this.journal.setCheckpoint(key,state);
     const started=Date.now();
-    const signal=[...(this.callControllers.get(input.call_id) || [])].at(-1)?.signal;
+    const signal=input.action==="preflight" ? [...(this.callControllers.get(input.call_id) || [])].at(-1)?.signal:undefined;
     const controlledRun:RunQuery=(query,variables,maxCost)=>this.run(query,variables,maxCost,{signal,deadlineAt:state.deadline_at});
     const ensureWithinCall=()=>{
-      if(this.journal.checkpoint(`ended-call:${input.call_id}`))throw new WorkflowRequired("call_ended","none");
+      if(input.action==="preflight" && this.journal.checkpoint(`ended-call:${input.call_id}`))throw new WorkflowRequired("call_ended","none");
       if(Date.now()>=state.deadline_at)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
     };
     const check=(c:any)=>{
@@ -449,6 +457,7 @@ export class VoiceService {
         this.journal.deleteCheckpoint(scanKey);
       }
     }catch(error){
+      if(Date.now()>=state.deadline_at || state.active_ms + Date.now()-started>=60000)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
       if(error instanceof BudgetUnavailableError || error instanceof RequestRateLimitError){
         state.retry_at=Number((error as any).retryAt) || this.journal.retryAt(input.operation_id || "");
         if(state.retry_at>=state.deadline_at)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");

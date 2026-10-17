@@ -213,6 +213,23 @@ describe("jobberGraphQL - account-id-based governor sharing", () => {
     expect(getGovernorForAccount(accountId)!.getState().currentlyAvailable).toBe(1500);
   });
 
+  it("merges a later resolver's lower shared-account snapshot before dispatching the next request", async () => {
+    const accountId = `late-resolver-${freshSessionId()}`;
+    const ctxA = httpCtx(accountId, "a-token");
+    mockRequireSessionContext.mockReturnValue(ctxA);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(200, { data: { ok: true }, extensions: { cost: costExtRaw({ maximumAvailable: 10000, currentlyAvailable: 9000, restoreRate: 500 }) } })));
+    await jobberGraphQL("query { x }", undefined, 1);
+
+    const ctxB = httpCtxWithAccountResolution(freshSessionId(), "b-token");
+    mockRequireSessionContext.mockReturnValue(ctxB);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(200, { data: { account: { id: accountId } }, extensions: { cost: costExtRaw({ maximumAvailable: 10000, currentlyAvailable: 100, restoreRate: 1 }) } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(jobberGraphQL("query { expensive }", undefined, 1000)).rejects.toMatchObject({ reasonCode: "budget_refilling" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(getGovernorForAccount(accountId)?.getState().currentlyAvailable).toBe(100);
+  });
+
   it("fails closed when account-id resolution fails instead of creating an independent budget", async () => {
     const ctx = httpCtxWithAccountResolution(freshSessionId());
     mockRequireSessionContext.mockReturnValue(ctx);
@@ -238,6 +255,24 @@ describe("jobberGraphQL - account-id-based governor sharing", () => {
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     controller.abort(reason);
     await expect(pending).rejects.toBe(reason);
+  });
+
+  it("keeps the request deadline and cancellation active while the response body is being read", async () => {
+    mockRequireSessionContext.mockReturnValue(null);
+    mockGetValidAccessToken.mockResolvedValue("t");
+    let bodySignal: AbortSignal | undefined;
+    const fetchMock = vi.fn((_url: string, init: { signal: AbortSignal }) => Promise.resolve({
+      status: 200,
+      headers: new Headers(),
+      json: () => new Promise((_resolve, reject) => {
+        bodySignal = init.signal;
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const pending = jobberGraphQL("query { x }", undefined, 10, { deadlineAt: Date.now() + 25 });
+    await expect(pending).rejects.toThrow(/timed out|cancelled/i);
+    expect(bodySignal?.aborted).toBe(true);
   });
 
   it("keeps a shared account governor alive for a still-open sibling session, removing it only once all its sessions close", async () => {
