@@ -224,6 +224,22 @@ describe("jobberGraphQL - account-id-based governor sharing", () => {
     expect(ctx.setAccountId).not.toHaveBeenCalled();
   });
 
+  it("preserves call cancellation while account identity is being resolved", async () => {
+    const ctx = httpCtxWithAccountResolution(freshSessionId());
+    mockRequireSessionContext.mockReturnValue(ctx);
+    const controller = new AbortController();
+    const reason = new Error("call ended");
+    const fetchMock = vi.fn((_url: string, init: { signal: AbortSignal }) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = jobberGraphQL("query { x }", undefined, 10, { signal: controller.signal });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+  });
+
   it("keeps a shared account governor alive for a still-open sibling session, removing it only once all its sessions close", async () => {
     const accountId = `refcount-acct-${freshSessionId()}`;
     const ctxA = httpCtxWithAccountResolution(freshSessionId());

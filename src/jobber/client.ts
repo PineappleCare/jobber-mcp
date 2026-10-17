@@ -115,6 +115,7 @@ async function resolveAccountId(ctx: SessionContext, control: AdmissionControl):
       throw error;
     }
   } catch (err: any) {
+    if (control.signal?.aborted) throw control.signal.reason ?? err;
     accountResolutionRetryAt.set(ctx.sessionId, Math.max(Date.now() + 1000, Number(err?.retryAt) || 0));
     console.error(
       "[jobber] Could not resolve account id for cost-governor sharing; this session will budget independently:",
