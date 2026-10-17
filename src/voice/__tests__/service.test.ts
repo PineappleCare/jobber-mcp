@@ -79,6 +79,39 @@ describe("Williams voice boundary", () => {
  });
 });
 describe("durable intake", () => {
+ it("keeps the preflight deadline through prerequisite reads and settles after retry backoff expires", async()=>{
+  const f=fixture(false),args={action:"preflight",call_id:"deadline-call",caller_number:"",operation_id:randomUUID(),intake};
+  const base=Date.now();vi.useFakeTimers();vi.setSystemTime(base);
+  f.run.mockImplementation(async(_q)=>{expect(f.journal.checkpoint(`preflight-operation:${args.operation_id}`)?.deadline_at).toBe(base+60000);vi.setSystemTime(base+70000);return {account:{id:"williams"}};});
+  const result=await f.service.dispatch(args);
+  expect(result).toMatchObject({outcome:"completed",preflight_state:"staff_review",reason_code:"duplicate_check_incomplete"});
+  expect(f.run).toHaveBeenCalledTimes(1);
+  vi.useRealTimers();
+  const retry=fixture(false),retryArgs={...args,call_id:"retry-deadline",operation_id:randomUUID()},start=Date.now();vi.useFakeTimers();vi.setSystemTime(start);
+  retry.run.mockRejectedValue(new JobberApiError("temporary read failure"));
+  const pending=await retry.service.dispatch(retryArgs);
+  expect(pending).toMatchObject({outcome:"pending",retry_at:start+15000});
+  vi.setSystemTime(start+60000);
+  await retry.service.tick();
+  await vi.waitFor(()=>expect(retry.journal.get(retryArgs.operation_id,retryArgs.call_id)).toMatchObject({outcome:"completed",preflight_state:"staff_review"}));
+  vi.useRealTimers();
+ });
+ it("unregisters only controllers owned by that operation when a sibling preflight is active", async()=>{
+  const f=fixture(false),original=f.run.getMockImplementation()!;let releaseMessage!:()=>void,releaseCensus!:(value:any)=>void;let messageBlocked=false,censusBlocked=false;let censusSignal:AbortSignal|undefined;
+  f.run.mockImplementation(async(q,v,cost,control)=>{
+   if(q.includes("VoiceAccount")&&!messageBlocked){messageBlocked=true;return await new Promise(resolve=>{releaseMessage=()=>resolve({account:{id:"williams"}});});}
+   if(q.includes("VoiceCensusClients")&&!censusBlocked){censusBlocked=true;censusSignal=control?.signal;return await new Promise(resolve=>{releaseCensus=resolve;});}
+   return original(q,v,cost,control);
+  });
+  const messageArgs={action:"message",call_id:"same-call",caller_number:"",operation_id:randomUUID(),record_type:"client",record_id:"missing",message:"synthetic note",confirmed:true};
+  const preflightArgs={action:"preflight",call_id:"same-call",caller_number:"",operation_id:randomUUID(),intake:{...intake,name:"New caller"}};
+  const message=f.service.dispatch(messageArgs);await vi.waitFor(()=>expect(messageBlocked).toBe(true));
+  const preflight=f.service.dispatch(preflightArgs);await vi.waitFor(()=>expect(censusBlocked).toBe(true));
+  releaseMessage();await message;
+  await f.service.dispatch({action:"end_call",call_id:"same-call",caller_number:""});
+  expect(censusSignal?.aborted).toBe(true);
+  releaseCensus({clients:conn([])});await preflight;
+ });
  it("lets a confirmed submission finish after hangup once its read-only census has started", async()=>{
   const f=fixture(false),args=input(),original=f.run.getMockImplementation()!;let release!:(value:any)=>void;let blocked=false;
   f.run.mockImplementation(async(q,v)=>{if(q.includes("VoiceCensusClients")&&!blocked){blocked=true;return await new Promise(r=>{release=r});}return original(q,v)});

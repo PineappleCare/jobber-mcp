@@ -69,7 +69,8 @@ export class CostGovernor {
   private maximumAvailable = DEFAULT_BUDGET;
   private lastCost: JobberCostExtension | null = null;
   private lastUpdatedAt: number;
-  private requestTimestamps: number[] = [];
+  private requestAttempts: Array<{ id: number; at: number }> = [];
+  private importedAttemptIds = new Set<number>();
   private admissionId = 0;
   private reservations = new Map<number, number>();
   private cooldownUntil = 0;
@@ -104,10 +105,11 @@ export class CostGovernor {
   private requestRateRetryAt(): number | undefined {
     const nowMs = this.now();
     const cutoff = nowMs - REQUEST_WINDOW_MS;
-    while (this.requestTimestamps.length > 0 && this.requestTimestamps[0] < cutoff) {
-      this.requestTimestamps.shift();
+    while (this.requestAttempts.length > 0 && this.requestAttempts[0].at < cutoff) {
+      const expired=this.requestAttempts.shift()!;
+      this.importedAttemptIds.delete(expired.id);
     }
-    if (this.requestTimestamps.length >= REQUEST_CEILING) return this.requestTimestamps[0] + REQUEST_WINDOW_MS;
+    if (this.requestAttempts.length >= REQUEST_CEILING) return this.requestAttempts[0].at + REQUEST_WINDOW_MS;
     return undefined;
   }
 
@@ -205,7 +207,7 @@ export class CostGovernor {
     if (control.signal?.aborted) throw control.signal.reason ?? new Error("Request cancelled");
     if (control.deadlineAt !== undefined && this.now() >= control.deadlineAt) throw new BudgetUnavailableError(1, this.now() + 1000);
     this.currentlyAvailable -= maxCost;
-    this.requestTimestamps.push(this.now());
+    this.requestAttempts.push({ id: nextAttemptIdentity++, at: this.now() });
     const id = ++this.admissionId;
     this.reservations.set(id, maxCost);
     return id;
@@ -228,9 +230,16 @@ export class CostGovernor {
     other.applyElapsedRefill();
     this.restoreRate = Math.min(this.restoreRate, other.restoreRate);
     this.maximumAvailable = Math.min(this.maximumAvailable, other.maximumAvailable);
-    this.currentlyAvailable = Math.min(this.currentlyAvailable, other.currentlyAvailable, this.maximumAvailable);
+    const outstanding = [...this.reservations.values()].reduce((sum, amount) => sum + amount, 0);
+    this.currentlyAvailable = Math.min(this.currentlyAvailable, other.currentlyAvailable - outstanding, this.maximumAvailable);
     this.lastUpdatedAt = Math.max(this.lastUpdatedAt, other.lastUpdatedAt);
-    this.requestTimestamps = [...new Set([...this.requestTimestamps, ...other.requestTimestamps])].sort((a,b)=>a-b);
+    for (const attempt of other.requestAttempts) {
+      if (attempt.at >= this.now() - REQUEST_WINDOW_MS && !this.importedAttemptIds.has(attempt.id)) {
+        this.requestAttempts.push(attempt);
+        this.importedAttemptIds.add(attempt.id);
+      }
+    }
+    this.requestAttempts.sort((a,b)=>a.at-b.at || a.id-b.id);
     this.cooldownUntil = Math.max(this.cooldownUntil, other.cooldownUntil);
   }
 
@@ -271,3 +280,5 @@ export class CostGovernor {
     return this.lastCost;
   }
 }
+
+let nextAttemptIdentity = 0;

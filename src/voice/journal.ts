@@ -31,7 +31,7 @@ export class VoiceJournal {
     return result;
   }
   pending(): {id:string;call:string}[] {
-    return this.db.prepare("SELECT o.id,o.call_id AS call FROM voice_operations o LEFT JOIN voice_operation_meta m ON m.id=o.id WHERE json_extract(o.result,'$.outcome') IN ('pending','uncertain') AND COALESCE(json_extract(o.result,'$.retry_at'),0)<=? AND COALESCE(m.lease_until,0)<=? ORDER BY COALESCE(m.last_attempt,0),COALESCE(json_extract(o.result,'$.retry_at'),0),o.rowid LIMIT 10").all(Date.now(),Date.now()) as any;
+    return this.db.prepare("SELECT o.id,o.call_id AS call FROM voice_operations o LEFT JOIN voice_operation_meta m ON m.id=o.id WHERE json_extract(o.result,'$.outcome') IN ('pending','uncertain') AND (COALESCE(json_extract(o.result,'$.retry_at'),0)<=? OR COALESCE(json_extract((SELECT value FROM voice_checkpoints WHERE key='preflight-operation:'||o.id),'$.deadline_at'),9223372036854775807)<=?) AND COALESCE(m.lease_until,0)<=? ORDER BY COALESCE(m.last_attempt,0),COALESCE(json_extract(o.result,'$.retry_at'),0),o.rowid LIMIT 10").all(Date.now(),Date.now(),Date.now()) as any;
   }
   claim(id:string): boolean {
     this.db.prepare("INSERT OR IGNORE INTO voice_operation_meta(id) VALUES(?)").run(id);

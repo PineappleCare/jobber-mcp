@@ -89,10 +89,25 @@ export class VoiceService {
   private jobs = new Map<string, Promise<VoiceResult>>();
   private preflightDuplicateChecks = new Map<string, { work: Promise<void>; expiresAt?: number; timer?: ReturnType<typeof setTimeout> }>();
   private callControllers = new Map<string, Set<AbortController>>();
+  private preflightControllers = new Map<string, AbortController>();
   private readChecks = new Map<string, { work: Promise<VoiceResult>; expires?: number; timer?: ReturnType<typeof setTimeout> }>();
   private lookupContext = new AsyncLocalStorage<string>();
   readonly directory: VoiceDirectory;
-  constructor(private journal: VoiceJournal, private run: RunQuery, private accountId: string) { this.directory=new VoiceDirectory(journal,run,accountId); }
+  constructor(private journal: VoiceJournal, private rawRun: RunQuery, private accountId: string) { this.directory=new VoiceDirectory(journal,rawRun,accountId); }
+  private run: RunQuery = async (query, variables, maxCost, control={}) => {
+    const id=this.lookupContext.getStore();
+    if(id) {
+      const original=voiceInput.parse(this.journal.input(id,this.journal.operationCall(id)));
+      if(original.action==="preflight") {
+        const deadline=this.journal.checkpoint(`preflight-operation:${id}`)?.deadline_at;
+        if(Number.isFinite(deadline) && Date.now()>=deadline)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
+        const controller=this.preflightControllers.get(id);
+        const deadlineAt=Number.isFinite(deadline) ? Math.min(control.deadlineAt ?? deadline,deadline):control.deadlineAt;
+        control={...control,signal:control.signal ?? controller?.signal,deadlineAt};
+      }
+    }
+    return this.rawRun(query,variables,maxCost,control);
+  };
   directoryHealth(): Record<string,unknown> {return this.directory.status();}
   inputNeverJournaled(id: unknown): boolean {return typeof id !== "string" || !this.journal.hasOperation(id);}
   async tick():Promise<void> { for(const op of this.journal.pending()) if(!this.jobs.has(op.id))void this.launch(voiceInput.parse(this.journal.input(op.id,op.call))); }
@@ -112,13 +127,13 @@ export class VoiceService {
       if(result.outcome==="completed" && ["resolve","status","preflight","email_prepare"].includes(original.action)) {
         return this.deliverRead(original, result);
       }
-      if(["pending","uncertain"].includes(result.outcome) && (!result.retry_at || result.retry_at<=Date.now())) this.launch(voiceInput.parse(this.journal.input(input.operation_id,input.call_id)));
+      if(["pending","uncertain"].includes(result.outcome) && (this.preflightExpired(input.operation_id) || !result.retry_at || result.retry_at<=Date.now())) this.launch(voiceInput.parse(this.journal.input(input.operation_id,input.call_id)));
       return result;
     }
     if(!input.operation_id) input.operation_id=randomUUID();
     const saved=this.journal.start(input.operation_id,input.call_id,input);
     if(!["pending","uncertain"].includes(saved.outcome))return saved.outcome === "completed" && ["resolve","status","preflight","email_prepare"].includes(input.action) ? this.deliverRead(input,saved) : saved;
-    if(saved.retry_at && saved.retry_at>Date.now())return saved;
+    if(saved.retry_at && saved.retry_at>Date.now() && !this.preflightExpired(input.operation_id))return saved;
     const work=this.launch(input);
     let timer:ReturnType<typeof setTimeout>;
     const timeout=new Promise<VoiceResult>(resolve=>{timer=setTimeout(()=>{const result=this.journal.get(input.operation_id!,input.call_id);resolve({...result,...(result.outcome === "pending" && !result.retry_at ? {retry_at:Date.now()+1000}: {})});},2000);});
@@ -210,16 +225,23 @@ export class VoiceService {
     const id=input.operation_id!;
     const old=this.jobs.get(id);if(old)return old;
     if(!this.journal.claim(id))return Promise.resolve(this.journal.get(id,input.call_id));
+    if(input.action==="preflight" && !this.journal.checkpoint(`preflight-operation:${id}`))this.journal.setCheckpoint(`preflight-operation:${id}`,{started_at:Date.now(),deadline_at:Date.now()+PREFLIGHT_SCAN_DEADLINE_MS});
     const heartbeat=setInterval(()=>this.journal.renew(id),30000);heartbeat.unref();
     const controller=new AbortController();
-    const controllers=this.callControllers.get(input.call_id) || new Set<AbortController>();
-    if(input.action==="preflight") { controllers.add(controller);this.callControllers.set(input.call_id,controllers); }
+    const controllers=this.callControllers.get(input.call_id);
+    const registered=input.action==="preflight";
+    const ownedControllers=controllers || new Set<AbortController>();
+    if(registered) { ownedControllers.add(controller);this.callControllers.set(input.call_id,ownedControllers);this.preflightControllers.set(id,controller); }
     const task=this.lookupContext.run(id,async()=>{
       let result:VoiceResult;
       try {
+        if(input.action==="preflight" && this.preflightExpired(id))throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
         const prior=this.journal.get(id,input.call_id);
         result=prior.outcome==="uncertain" ? await this.execute({action:"operation_status",operation_id:id,call_id:input.call_id,caller_number:input.caller_number}) : await this.execute(input);
       }catch(error){
+        if(input.action==="preflight" && this.preflightExpired(id)) {
+          result={operation_id:id,outcome:"completed",preflight_id:id,intake_fingerprint:fingerprint(input.intake),missing_fields:[],preflight_state:"staff_review",reason_code:"duplicate_check_incomplete",next_action:"staff_review",records:{}};
+        } else {
         const permanent=error instanceof Permanent || error instanceof WorkflowRequired || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError;
         result=this.journal.get(id,input.call_id);result.outcome=permanent ? "failed":"pending";
         result.reason_code=error instanceof WorkflowRequired ? error.code:permanent ? "validation_or_authorization":readFailureReason(error);
@@ -228,13 +250,15 @@ export class VoiceService {
         if(Number.isFinite((error as any)?.retryAt))result.retry_at=Math.max(this.journal.retryAt(id),Number((error as any).retryAt));
         else result.retry_at=this.journal.retryAt(id);
         if(error instanceof WorkflowRequired)result.choices=error.choices;
+        }
       }
-      result.operation_id=id; this.journal.save(id,result);if(result.outcome==="completed")this.journal.clearScan(id);
+      result.operation_id=id; this.journal.save(id,result);if(result.outcome==="completed"){this.journal.clearScan(id);this.journal.deleteCheckpoint(`preflight-operation:${id}`);}
       if(["preflight","resolve","status","email_prepare"].includes(input.action))await appendAuditLog({account_id:this.accountId,service_session_id:"voice-service",tool:`voice_${input.action}`,args:{operation_id:id,call_id:input.call_id,reason_code:result.reason_code,stage:result.failed_step || result.preflight_state || "complete"},outcome:result.outcome==="completed" ? "success":"error"});
       return result;
-    }).finally(()=>{clearInterval(heartbeat);this.journal.release(id);this.jobs.delete(id);controllers.delete(controller);if(!controllers.size)this.callControllers.delete(input.call_id);});
+    }).finally(()=>{clearInterval(heartbeat);this.journal.release(id);this.jobs.delete(id);if(registered){ownedControllers.delete(controller);if(this.preflightControllers.get(id)===controller)this.preflightControllers.delete(id);if(this.callControllers.get(input.call_id)===ownedControllers && !ownedControllers.size)this.callControllers.delete(input.call_id);}});
     this.jobs.set(id,task);return task;
   }
+  private preflightExpired(id:string):boolean { const deadline=this.journal.checkpoint(`preflight-operation:${id}`)?.deadline_at;return Number.isFinite(deadline) && Date.now()>=deadline; }
   private async scan(query:string,variables:Record<string,unknown>):Promise<any> {
     const id=this.lookupContext.getStore();
     if(id) {const original=voiceInput.parse(this.journal.input(id,this.journal.operationCall(id)));if(["resolve","preflight"].includes(original.action) && this.journal.checkpoint(`ended-call:${original.call_id}`))throw new WorkflowRequired("call_ended","none");}
@@ -414,11 +438,13 @@ export class VoiceService {
     let state=this.journal.checkpoint(key);
     if(state?.pass>=2)state=undefined;
     const now=Date.now();
-    state=state?.version===2 ? state:{version:2,generation:randomUUID(),active_ms:0,pass:0,started_at:now,deadline_at:now+PREFLIGHT_SCAN_DEADLINE_MS};
+    const operationDeadline=input.action==="preflight" ? this.journal.checkpoint(`preflight-operation:${input.operation_id}`)?.deadline_at:undefined;
+    state=state?.version===2 ? state:{version:2,generation:randomUUID(),active_ms:0,pass:0,started_at:now,deadline_at:operationDeadline ?? now+PREFLIGHT_SCAN_DEADLINE_MS};
+    if(Number.isFinite(operationDeadline))state.deadline_at=Math.min(state.deadline_at,operationDeadline);
     if(!Number.isFinite(state.deadline_at))state.deadline_at=Date.now()+PREFLIGHT_SCAN_DEADLINE_MS;
     this.journal.setCheckpoint(key,state);
     const started=Date.now();
-    const signal=input.action==="preflight" ? [...(this.callControllers.get(input.call_id) || [])].at(-1)?.signal:undefined;
+    const signal=input.action==="preflight" ? this.preflightControllers.get(input.operation_id!)?.signal:undefined;
     const controlledRun:RunQuery=(query,variables,maxCost)=>this.run(query,variables,maxCost,{signal,deadlineAt:state.deadline_at});
     const ensureWithinCall=()=>{
       if(input.action==="preflight" && this.journal.checkpoint(`ended-call:${input.call_id}`))throw new WorkflowRequired("call_ended","none");

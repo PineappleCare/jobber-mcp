@@ -215,19 +215,48 @@ describe("jobberGraphQL - account-id-based governor sharing", () => {
 
   it("merges a later resolver's lower shared-account snapshot before dispatching the next request", async () => {
     const accountId = `late-resolver-${freshSessionId()}`;
-    const ctxA = httpCtx(accountId, "a-token");
+    const ctxA = httpCtx(freshSessionId(), "a-token");
+    ctxA.getAccountId.mockReturnValue(accountId);
     mockRequireSessionContext.mockReturnValue(ctxA);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(200, { data: { ok: true }, extensions: { cost: costExtRaw({ maximumAvailable: 10000, currentlyAvailable: 9000, restoreRate: 500 }) } })));
-    await jobberGraphQL("query { x }", undefined, 1);
+    const resolveA: Array<(response: any) => void> = [];
+    let pendingA = 0;
+    const fetchA = vi.fn(() => new Promise(resolve => {
+      pendingA++;
+      resolveA.push(resolve);
+    }));
+    vi.stubGlobal("fetch", fetchA);
+    const a1 = jobberGraphQL("query { siblingA }", undefined, 1000);
+    const a2 = jobberGraphQL("query { siblingB }", undefined, 1000);
+    await vi.waitFor(() => expect(pendingA).toBe(2));
 
     const ctxB = httpCtxWithAccountResolution(freshSessionId(), "b-token");
     mockRequireSessionContext.mockReturnValue(ctxB);
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(jsonResponse(200, { data: { account: { id: accountId } }, extensions: { cost: costExtRaw({ maximumAvailable: 10000, currentlyAvailable: 100, restoreRate: 1 }) } }));
+      .mockResolvedValueOnce(jsonResponse(200, { data: { account: { id: accountId } }, extensions: { cost: costExtRaw({ maximumAvailable: 10000, currentlyAvailable: 1000, restoreRate: 1 }) } }));
     vi.stubGlobal("fetch", fetchMock);
     await expect(jobberGraphQL("query { expensive }", undefined, 1000)).rejects.toMatchObject({ reasonCode: "budget_refilling" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(getGovernorForAccount(accountId)?.getState().currentlyAvailable).toBe(100);
+    expect(getGovernorForAccount(accountId)?.getState().currentlyAvailable).toBeLessThan(0);
+    const response = jsonResponse(200, { data: { ok: true } });
+    // Resolve both independent in-flight sibling attempts without sharing a resolver callback.
+    for (const resolve of resolveA) resolve(response);
+    await Promise.all([a1, a2]);
+  });
+
+  it("counts same-millisecond request attempts independently through account seeding", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-17T12:00:00Z"));
+    const ctx = httpCtx(freshSessionId());
+    mockRequireSessionContext.mockReturnValue(ctx);
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { data: { ok: true } }));
+    vi.stubGlobal("fetch", fetchMock);
+    for (let i = 0; i < 2500; i++) await jobberGraphQL("query { x }", undefined, 1);
+    const b = httpCtxWithAccountResolution(freshSessionId());
+    mockRequireSessionContext.mockReturnValue(b);
+    const resolution = vi.fn().mockResolvedValue(jsonResponse(200, { data: { account: { id: `test-account-${ctx.sessionId}` } } }));
+    vi.stubGlobal("fetch", resolution);
+    await expect(jobberGraphQL("query { overCeiling }", undefined, 1)).rejects.toThrow(/Request rate limit/);
+    expect(resolution).toHaveBeenCalledTimes(1);
   });
 
   it("fails closed when account-id resolution fails instead of creating an independent budget", async () => {
