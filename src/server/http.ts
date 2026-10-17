@@ -187,15 +187,15 @@ if (process.env.JOBBER_VOICE_ENABLED === "true") {
   const record = { tokens: null, accountId: undefined, refreshInFlight: null } as SessionRecord;
   const context = buildSessionContext(record, "voice-service");
   const service = new VoiceService(new VoiceJournal(`${process.env.JOBBER_STATE_DIR}/voice-operations.db`),
-    (query, variables, maxCost = 1000) => sessionStorage.run(context, () =>
-      query.trim().startsWith("mutation") ? jobberGraphQLWrite(query, variables, maxCost) : jobberGraphQL(query, variables, maxCost)), account);
+    (query, variables, maxCost = 1000, control) => sessionStorage.run(context, () =>
+      query.trim().startsWith("mutation") ? jobberGraphQLWrite(query, variables, maxCost, control) : jobberGraphQL(query, variables, maxCost, control)), account);
   registerVoiceRoutes(app, service, key);
   setInterval(()=>{void sessionStorage.run(context,()=>service.tick()).catch(()=>{});},1000).unref();
   // Resume saved census pages promptly after transient failure, instead of
   // pausing an incomplete index for the full five-minute refresh interval.
   const refresh=()=>{void sessionStorage.run(context,()=>service.directory.refresh()).then(
     ()=>{setTimeout(refresh,5*60*1000).unref();},
-    ()=>{setTimeout(refresh,15000).unref();});};
+    (error)=>{const retryAt=Number(error?.retryAt);const delay=Math.max(15000,Number.isFinite(retryAt) ? retryAt-Date.now():0);setTimeout(refresh,delay).unref();});};
   refresh();
 }
 

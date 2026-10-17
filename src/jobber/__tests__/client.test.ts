@@ -49,7 +49,7 @@ function httpCtx(sessionId: string, accessToken = "session-token") {
     // Default to "already attempted and failed" so existing tests (which only mock the fetch
     // responses for their own request) don't unexpectedly need to also mock an account-id
     // resolution call. Tests that specifically exercise account-id resolution/sharing override this.
-    getAccountId: vi.fn().mockReturnValue(null),
+    getAccountId: vi.fn().mockReturnValue(`test-account-${sessionId}`),
     setAccountId: vi.fn(),
   };
 }
@@ -137,7 +137,7 @@ describe("jobberGraphQL - success + cost recording", () => {
     );
 
     await jobberGraphQL("query { x }", undefined, 10);
-    expect(getGovernorForSession(sessionId).getState().currentlyAvailable).toBe(4321);
+    expect(getGovernorForAccount(`test-account-${sessionId}`)?.getState().currentlyAvailable).toBe(4321);
   });
 });
 
@@ -213,29 +213,15 @@ describe("jobberGraphQL - account-id-based governor sharing", () => {
     expect(getGovernorForAccount(accountId)!.getState().currentlyAvailable).toBe(1500);
   });
 
-  it("falls back to a per-session governor, without retrying resolution, when account-id resolution fails", async () => {
+  it("fails closed when account-id resolution fails instead of creating an independent budget", async () => {
     const ctx = httpCtxWithAccountResolution(freshSessionId());
     mockRequireSessionContext.mockReturnValue(ctx);
 
-    vi.stubGlobal(
-      "fetch",
-      vi
-        .fn()
-        .mockRejectedValueOnce(new Error("network blip"))
-        .mockResolvedValueOnce(jsonResponse(200, { data: { ok: true }, extensions: { cost: costExt(9000) } }))
-    );
-    const data = await jobberGraphQL("query { x }", undefined, 10);
-    expect(data).toEqual({ ok: true });
-    expect(ctx.setAccountId).toHaveBeenCalledWith(null);
-
-    // A second call on the same session must not retry account-id resolution (it's cached as
-    // failed) - exactly one fetch call for the real request, none for a resolution retry.
-    const fetchMock2 = vi
-      .fn()
-      .mockResolvedValueOnce(jsonResponse(200, { data: { ok: true }, extensions: { cost: costExt(8000) } }));
-    vi.stubGlobal("fetch", fetchMock2);
-    await jobberGraphQL("query { x }", undefined, 10);
-    expect(fetchMock2).toHaveBeenCalledTimes(1);
+    const fetchMock = vi.fn().mockRejectedValueOnce(new Error("network blip"));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toMatchObject({ reasonCode: "account_budget_unavailable" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(ctx.setAccountId).not.toHaveBeenCalled();
   });
 
   it("keeps a shared account governor alive for a still-open sibling session, removing it only once all its sessions close", async () => {
@@ -335,7 +321,7 @@ describe("jobberGraphQL - GraphQL errors", () => {
     );
 
     await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(JobberGraphQLRequestError);
-    expect(getGovernorForSession(sessionId).getState().currentlyAvailable).toBe(1234);
+    expect(getGovernorForAccount(`test-account-${sessionId}`)?.getState().currentlyAvailable).toBe(1234);
   });
 
   it("does not misclassify an unrelated error mentioning 'plan' as a permission error", async () => {
@@ -590,10 +576,11 @@ describe("jobberGraphQL - THROTTLED (HTTP 200 body)", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const resultPromise = jobberGraphQL("query { x }", undefined, 10);
+    await vi.advanceTimersByTimeAsync(0);
     // need 10, have 0, restoreRate 500 → 20ms wait
     await vi.advanceTimersByTimeAsync(19);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(21);
     const data = await resultPromise;
     expect(data).toEqual({ ok: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -617,10 +604,11 @@ describe("jobberGraphQL - THROTTLED (HTTP 200 body)", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const resultPromise = jobberGraphQL("query { x }", undefined, 1000);
+    await vi.advanceTimersByTimeAsync(0);
     // No cost data → assumeDepleted() zeroes budget; need 1000, have 0, restoreRate 500 → 2000ms wait.
     await vi.advanceTimersByTimeAsync(1999);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(21);
     const data = await resultPromise;
     expect(data).toEqual({ ok: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -650,10 +638,11 @@ describe("jobberGraphQL - THROTTLED (HTTP 200 body)", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const resultPromise = jobberGraphQL("query { x }", undefined, 10);
+    await vi.advanceTimersByTimeAsync(0);
     // need 10, have 0, restoreRate 500 → 20ms wait
     await vi.advanceTimersByTimeAsync(19);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(21);
     const data = await resultPromise;
     expect(data).toEqual({ ok: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -670,8 +659,9 @@ describe("jobberGraphQL - THROTTLED (HTTP 200 body)", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const resultPromise = jobberGraphQL("query { x }", undefined, 10);
+    await vi.advanceTimersByTimeAsync(0);
     const assertion = expect(resultPromise).rejects.toThrow(/throttled/i);
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(2000);
     await assertion;
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
@@ -694,7 +684,6 @@ describe("jobberGraphQL - HTTP 429", () => {
   });
 
   it("falls back to exponential backoff when Retry-After is absent", async () => {
-    vi.useFakeTimers();
     mockRequireSessionContext.mockReturnValue(null);
     mockGetValidAccessToken.mockResolvedValue("t");
 
@@ -704,13 +693,11 @@ describe("jobberGraphQL - HTTP 429", () => {
       .mockResolvedValueOnce(jsonResponse(200, { data: { ok: true }, extensions: { cost: costExt(9000) } }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const resultPromise = jobberGraphQL("query { x }", undefined, 10);
-    await vi.advanceTimersByTimeAsync(1000);
-    const data = await resultPromise;
+    const data = await jobberGraphQL("query { x }", undefined, 10);
     expect(data).toEqual({ ok: true });
   });
 
-  it("falls back to exponential backoff when Retry-After is present but non-numeric", async () => {
+  it("honors a valid HTTP-date Retry-After without retrying ahead of the provider", async () => {
     vi.useFakeTimers();
     mockRequireSessionContext.mockReturnValue(null);
     mockGetValidAccessToken.mockResolvedValue("t");
@@ -721,18 +708,11 @@ describe("jobberGraphQL - HTTP 429", () => {
       .mockResolvedValueOnce(jsonResponse(200, { data: { ok: true }, extensions: { cost: costExt(9000) } }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const resultPromise = jobberGraphQL("query { x }", undefined, 10);
-    // A non-numeric Retry-After must not collapse to a ~0ms retry; it should
-    // fall back to the same backoff schedule used when the header is absent.
-    await vi.advanceTimersByTimeAsync(999);
+    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toMatchObject({ reasonCode: "provider_throttled" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    const data = await resultPromise;
-    expect(data).toEqual({ ok: true });
   });
 
-  it("treats a negative Retry-After as invalid and falls back to the default backoff schedule instead of retrying instantly", async () => {
-    vi.useFakeTimers();
+  it("treats a negative Retry-After as invalid and uses the bounded default backoff", async () => {
     mockRequireSessionContext.mockReturnValue(null);
     mockGetValidAccessToken.mockResolvedValue("t");
 
@@ -742,16 +722,12 @@ describe("jobberGraphQL - HTTP 429", () => {
       .mockResolvedValueOnce(jsonResponse(200, { data: { ok: true }, extensions: { cost: costExt(9000) } }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const resultPromise = jobberGraphQL("query { x }", undefined, 10);
-    await vi.advanceTimersByTimeAsync(999);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    const data = await resultPromise;
+    const data = await jobberGraphQL("query { x }", undefined, 10);
     expect(data).toEqual({ ok: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("clamps an excessively large Retry-After to 10s instead of waiting the full header value", async () => {
+  it("preserves an excessively large Retry-After as a shared cooldown and returns for later retry", async () => {
     vi.useFakeTimers();
     mockRequireSessionContext.mockReturnValue(null);
     mockGetValidAccessToken.mockResolvedValue("t");
@@ -762,13 +738,8 @@ describe("jobberGraphQL - HTTP 429", () => {
       .mockResolvedValueOnce(jsonResponse(200, { data: { ok: true }, extensions: { cost: costExt(9000) } }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const resultPromise = jobberGraphQL("query { x }", undefined, 10);
-    await vi.advanceTimersByTimeAsync(9999);
+    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toMatchObject({ reasonCode: "provider_throttled" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    const data = await resultPromise;
-    expect(data).toEqual({ ok: true });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("fails after exceeding 3 retries", async () => {
