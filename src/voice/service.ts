@@ -92,9 +92,21 @@ export class VoiceService {
   private preflightControllers = new Map<string, AbortController>();
   private readChecks = new Map<string, { work: Promise<VoiceResult>; expires?: number; timer?: ReturnType<typeof setTimeout> }>();
   private lookupContext = new AsyncLocalStorage<string>();
+  // Fresh authorization reads temporarily leave lookupContext to avoid its
+  // memoized census pages. Keep their operation controls in a separate context
+  // so pagination still observes the same deadline and hangup cancellation.
+  private preflightReadContext = new AsyncLocalStorage<{ operationId:string; callId:string; control:AdmissionControl }>();
   readonly directory: VoiceDirectory;
   constructor(private journal: VoiceJournal, private rawRun: RunQuery, private accountId: string) { this.directory=new VoiceDirectory(journal,rawRun,accountId); }
   private run: RunQuery = async (query, variables, maxCost, control={}) => {
+    const fresh=this.preflightReadContext.getStore();
+    if(fresh) {
+      if(this.journal.checkpoint(`ended-call:${fresh.callId}`) || fresh.control.signal?.aborted)throw new WorkflowRequired("call_ended","none");
+      const deadline=fresh.control.deadlineAt;
+      if(Number.isFinite(deadline) && Date.now()>=deadline!)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
+      const deadlineAt=Number.isFinite(deadline) ? Math.min(control.deadlineAt ?? deadline!,deadline!):control.deadlineAt;
+      control={...control,...fresh.control,deadlineAt,signal:fresh.control.signal ?? control.signal};
+    }
     const id=this.lookupContext.getStore();
     if(id) {
       const original=voiceInput.parse(this.journal.input(id,this.journal.operationCall(id)));
@@ -392,6 +404,7 @@ export class VoiceService {
     try {
       const selected=await this.destination(input);
       if(!selected.client)await this.checkDuplicates(input);
+      this.assertPreflightActive(input.operation_id!,input.call_id);
       return {...base,preflight_state:"ready",destination:{...(selected.client ? {client_id:selected.client.id,name:selected.client.name}: {new_client:true,name:i!.company || i!.name}),...(selected.property ? {property_id:selected.property.id,address:[selected.property.street1,selected.property.street2,selected.property.city].filter(Boolean).join(", ")}:{new_property:true,address:[i!.street1,i!.street2,i!.city].filter(Boolean).join(", ")})},next_action:"read_back_and_confirm"};
     }catch(error){
       if(!(error instanceof WorkflowRequired))throw error;
@@ -493,10 +506,31 @@ export class VoiceService {
   }
   private async fresh(number: string | null, clientId: string): Promise<Match> {
     if (!number) throw new Permanent("Caller phone is not matched");
-    const c = (await this.run(clientQuery, { id: clientId }, 1500)).client;
-    const m = c && await this.lookupContext.run("",()=>this.match(c, number,true));
+    const read=async()=>{
+      const c = (await this.run(clientQuery, { id: clientId }, 1500)).client;
+      return c && await this.lookupContext.run("",()=>this.match(c, number,true));
+    };
+    const operationId=this.lookupContext.getStore();
+    if(operationId) {
+      const original=voiceInput.parse(this.journal.input(operationId,this.journal.operationCall(operationId)));
+      if(original.action==="preflight") {
+        const deadline=this.journal.checkpoint(`preflight-operation:${operationId}`)?.deadline_at;
+        const controller=this.preflightControllers.get(operationId);
+        const control:AdmissionControl={...(controller ? {signal:controller.signal}:{}),...(Number.isFinite(deadline) ? {deadlineAt:deadline}: {})};
+        return this.preflightReadContext.run({operationId,callId:original.call_id,control},read).then(m=>{
+          this.assertPreflightActive(operationId,original.call_id);
+          if(!m)throw new Permanent("Caller phone is not matched");
+          return m;
+        });
+      }
+    }
+    const m=await read();
     if (!m) throw new Permanent("Caller phone is not matched");
     return m;
+  }
+  private assertPreflightActive(operationId:string,callId:string):void {
+    if(this.journal.checkpoint(`ended-call:${callId}`) || this.preflightControllers.get(operationId)?.signal.aborted)throw new WorkflowRequired("call_ended","none");
+    if(this.preflightExpired(operationId))throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
   }
   private allowed(m: Match, propertyId?: string): boolean { return !m.propertyIds || (!!propertyId && m.propertyIds.has(propertyId)); }
   private accessScope(m:Match):string {

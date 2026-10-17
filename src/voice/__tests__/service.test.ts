@@ -20,7 +20,7 @@ function fixture(existing = true) {
  const cs: any[] = existing ? [structuredClone(client)] : [];
  const requests: any[] = [], noteRecords: any[] = [];
  let assessment: any = null;
- const run = vi.fn(async (query: string, vars: any = {}) => {
+ const run = vi.fn(async (query: string, vars: any = {}, _cost?: number, _control?: any) => {
   if (query.includes("VoiceAccount")) return { account: { id: "williams" } };
   if (query.includes("VoiceClients(")) return { clients: conn(cs) };
   if (query.includes("VoiceCensusClients")) return {clients:conn(cs.map(c=>({...c,contacts:conn(c.contacts || [])})))};
@@ -511,6 +511,49 @@ describe("revision-bound preflight and recovery",()=>{
   f.run.mockImplementation(async(q,v)=>{const r=await original(q,v);if(q.includes("VoiceCensusClients"))f.journal.setCheckpoint("ended-call:call1",{ended_at:Date.now()});return r;});
   const r=await f.service.dispatch({action:"preflight",call_id:"call1",caller_number:"+17055550101",operation_id:randomUUID(),intake});
   expect(r).toMatchObject({outcome:"failed",reason_code:"call_ended",next_action:"none"});expect(r.preflight_state).toBeUndefined();
+ });
+ it("keeps fresh selected-contact pagination inside the persisted preflight deadline",async()=>{
+  const f=fixture(),args={action:"preflight",call_id:"contact-deadline",caller_number:"+17055550100",operation_id:randomUUID(),intake:{...intake,client_id:"c1",property_id:"p1",street1:"1 Main"}};
+  f.cs[0].phones=[];
+  const base=Date.now();vi.useFakeTimers();vi.setSystemTime(base);
+  const original=f.run.getMockImplementation()!,reads:{query:string;at:number;deadlineAt?:number;signal?:AbortSignal}[]=[];
+  f.run.mockImplementation(async(q,v,cost,control)=>{
+   if(q.includes("VoiceClient(")||q.includes("VoiceContacts"))reads.push({query:q,at:Date.now(),deadlineAt:control?.deadlineAt,signal:control?.signal});
+   if(q.includes("VoiceContacts")) {
+    const page=v?.after ? Number(String(v.after).replace("cursor",""))+1:0;
+    const contact={id:`contact-${page}`,phones:conn([{number:"+17055550100"}]),properties:conn([{id:"p1"}]),emails:conn([])};
+    const result={client:{contacts:{nodes:[contact],pageInfo:{hasNextPage:page<3,endCursor:`cursor${page}`}}}};
+    vi.setSystemTime(Date.now()+20000);
+    return result;
+   }
+   return original(q,v,cost,control);
+  });
+  try {
+   const result=await f.service.dispatch(args);
+   expect(result).toMatchObject({outcome:"completed",preflight_state:"staff_review",reason_code:"duplicate_check_incomplete",next_action:"staff_review"});
+   expect(reads.filter(r=>r.query.includes("VoiceContacts")).map(r=>r.at)).toEqual([base,base+20000,base+40000]);
+   expect(reads.every(r=>r.deadlineAt===base+60000&&r.signal instanceof AbortSignal)).toBe(true);
+   expect(reads.some(r=>r.at>=base+60000)).toBe(false);
+  } finally {vi.useRealTimers();}
+ });
+ it("stops fresh selected-contact pagination after hangup",async()=>{
+  const f=fixture(),args={action:"preflight",call_id:"contact-hangup",caller_number:"+17055550100",operation_id:randomUUID(),intake:{...intake,client_id:"c1",property_id:"p1",street1:"1 Main"}};
+  f.cs[0].phones=[];
+  const original=f.run.getMockImplementation()!;let release!:(value:any)=>void,blocked=false;
+  f.run.mockImplementation(async(q,v,cost,control)=>{
+   if(q.includes("VoiceContacts")) {
+    if(!blocked){blocked=true;return await new Promise(resolve=>{release=resolve;});}
+    throw new Error("contact read dispatched after hangup");
+   }
+   return original(q,v,cost,control);
+  });
+  const pending=f.service.dispatch(args);
+  await vi.waitFor(()=>expect(blocked).toBe(true));
+  await f.service.dispatch({action:"end_call",call_id:args.call_id,caller_number:args.caller_number});
+  release({client:{contacts:{nodes:[{id:"contact-0",phones:conn([{number:"+17055550100"}]),properties:conn([{id:"p1"}]),emails:conn([])}],pageInfo:{hasNextPage:true,endCursor:"cursor0"}}}});
+  const result=await pending;
+  expect(result).toMatchObject({outcome:"failed",reason_code:"call_ended",next_action:"none"});
+  expect(f.run.mock.calls.filter(([q])=>q.includes("VoiceContacts"))).toHaveLength(1);
  });
  it("persists the scan generation before provider I/O and settles an expired deadline as staff review",async()=>{
   const f=fixture(false),base=Date.now(),key="duplicate-work:preflight:deadline-probe";vi.useFakeTimers();vi.setSystemTime(base);
