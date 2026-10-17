@@ -74,7 +74,7 @@ describe("CostGovernor", () => {
       });
       // need 600, have 100 → (600-100)/500 = 1s = 1000ms
       await governor.checkBudget(600);
-      expect(sleepFn).toHaveBeenCalledWith(1000);
+      expect(sleepFn).toHaveBeenCalledWith(1000, undefined);
     });
 
     it("reserves the requested maxCost after waiting out the refill", async () => {
@@ -97,11 +97,10 @@ describe("CostGovernor", () => {
       const clock = fakeClock();
       const sleepFn = vi.fn(async (ms:number)=>{clock.advance(ms);});
       const governor = new CostGovernor(sleepFn, clock.now);
-      // Default budget is 10000 @ 500/s - asking for 10001 on the very first call (no
-      // recordCost/assumeDepleted priming) needs a 2ms wait, well under the 5s cap.
+      // The available balance can never exceed its reported maximum, so an impossible
+      // request is rejected without an unbounded refill loop.
       await expect(governor.checkBudget(10001)).rejects.toThrow(BudgetUnavailableError);
-      expect(sleepFn).toHaveBeenCalledWith(2);
-      // A request above the absolute ceiling must never be admitted, even after sleeping.
+      expect(sleepFn).not.toHaveBeenCalled();
       expect(governor.getState().currentlyAvailable).toBe(10000);
     });
   });
@@ -143,7 +142,7 @@ describe("CostGovernor", () => {
       });
       // need 2500, have 0 → 2500/500 = 5s exactly
       await expect(governor.checkBudget(2500)).resolves.toBeUndefined();
-      expect(sleepFn).toHaveBeenCalledWith(5000);
+      expect(sleepFn).toHaveBeenCalledWith(5000, undefined);
     });
   });
 
@@ -244,6 +243,20 @@ describe("CostGovernor", () => {
   });
 
   describe("reservation", () => {
+    it("keeps sibling reservations deducted when a lower provider snapshot arrives", async () => {
+      const clock = fakeClock();
+      const governor = new CostGovernor(async ms => { clock.advance(ms); }, clock.now);
+      governor.recordCost({ requestedQueryCost: 0, actualQueryCost: 0, throttleStatus: { maximumAvailable: 10000, currentlyAvailable: 10000, restoreRate: 500 } });
+      const first = await governor.admit(1000);
+      await governor.admit(1000);
+      governor.settleAdmission(first);
+      governor.recordCost({ requestedQueryCost: 1000, actualQueryCost: 1000, throttleStatus: { maximumAvailable: 10000, currentlyAvailable: 1000, restoreRate: 500 } }, first);
+      expect(governor.getState().currentlyAvailable).toBe(0);
+      const before = clock.now();
+      await governor.admit(1000);
+      expect(clock.now() - before).toBe(2000);
+    });
+
     it("accounts for a prior checkBudget's reservation when a second call runs before any recordCost", async () => {
       const clock = fakeClock();
       const sleepFn = vi.fn(async (ms:number)=>{clock.advance(ms);});
@@ -259,7 +272,7 @@ describe("CostGovernor", () => {
       // A second concurrent call for 600 more should see only 400 available, not the stale 1000.
       await governor.checkBudget(600);
       // need 600, have 400 → (600-400)/500 = 400ms wait
-      expect(sleepFn).toHaveBeenCalledWith(400);
+      expect(sleepFn).toHaveBeenCalledWith(400, undefined);
     });
 
     it("releaseReservation restores budget without exceeding maximumAvailable", () => {
@@ -321,7 +334,7 @@ describe("CostGovernor", () => {
     const sleep=vi.fn(async(ms:number)=>{clock.advance(ms/2);governor.recordCost({requestedQueryCost:1,actualQueryCost:1,throttleStatus:{maximumAvailable:10000,currentlyAvailable:0,restoreRate:500}});clock.advance(ms/2)});
     governor=new CostGovernor(sleep,clock.now);governor.assumeDepleted();
     await expect(governor.checkBudget(500)).rejects.toThrow(BudgetUnavailableError);
-    expect(governor.getState().currentlyAvailable).toBe(250);
+    expect(governor.getState().currentlyAvailable).toBe(166);
   });
 
   describe("assumeDepleted / backoffMsFor", () => {

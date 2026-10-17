@@ -1,4 +1,5 @@
 import { BudgetUnavailableError, RequestRateLimitError } from "../jobber/cost-governor.js";
+import type { AdmissionControl } from "../jobber/cost-governor.js";
 import { JobberPermissionError, JobberAuthenticationError, hasMutationExecutionErrors } from "../jobber/client.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
@@ -12,7 +13,9 @@ import type { VoiceJournal, VoiceResult } from "./journal.js";
 import { appendAuditLog } from "../utils/auditLog.js";
 import { appointment, contactDetails, customerStatus, serviceAddress } from "./customer.js";
 
-export type RunQuery = (query: string, variables?: Record<string, unknown>, maxCost?: number) => Promise<any>;
+export type RunQuery = (query: string, variables?: Record<string, unknown>, maxCost?: number, control?: AdmissionControl) => Promise<any>;
+const PREFLIGHT_SCAN_DEADLINE_MS = 60_000;
+const PREFLIGHT_RESULT_REUSE_MS = 30_000;
 const text = z.string().trim().max(10000);
 export const voiceInput = z.object({
   action: z.enum(["resolve", "status", "prepare", "preflight", "submit", "message", "email_prepare", "contact_email", "operation_status", "end_call"]),
@@ -84,18 +87,50 @@ export class VoiceService {
   private running = new Set<string>();
   private gates = new KeyedGate();
   private jobs = new Map<string, Promise<VoiceResult>>();
-  private preflightDuplicateChecks = new Map<string, Promise<void>>();
+  private preflightDuplicateChecks = new Map<string, { work: Promise<void>; expiresAt?: number; timer?: ReturnType<typeof setTimeout> }>();
+  private callControllers = new Map<string, Set<AbortController>>();
+  private preflightControllers = new Map<string, AbortController>();
   private readChecks = new Map<string, { work: Promise<VoiceResult>; expires?: number; timer?: ReturnType<typeof setTimeout> }>();
   private lookupContext = new AsyncLocalStorage<string>();
+  // Fresh authorization reads temporarily leave lookupContext to avoid its
+  // memoized census pages. Keep their operation controls in a separate context
+  // so pagination still observes the same deadline and hangup cancellation.
+  private preflightReadContext = new AsyncLocalStorage<{ operationId:string; callId:string; control:AdmissionControl }>();
   readonly directory: VoiceDirectory;
-  constructor(private journal: VoiceJournal, private run: RunQuery, private accountId: string) { this.directory=new VoiceDirectory(journal,run,accountId); }
+  constructor(private journal: VoiceJournal, private rawRun: RunQuery, private accountId: string) { this.directory=new VoiceDirectory(journal,rawRun,accountId); }
+  private run: RunQuery = async (query, variables, maxCost, control={}) => {
+    const fresh=this.preflightReadContext.getStore();
+    if(fresh) {
+      if(this.journal.checkpoint(`ended-call:${fresh.callId}`) || fresh.control.signal?.aborted)throw new WorkflowRequired("call_ended","none");
+      const deadline=fresh.control.deadlineAt;
+      if(Number.isFinite(deadline) && Date.now()>=deadline!)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
+      const deadlineAt=Number.isFinite(deadline) ? Math.min(control.deadlineAt ?? deadline!,deadline!):control.deadlineAt;
+      control={...control,...fresh.control,deadlineAt,signal:fresh.control.signal ?? control.signal};
+    }
+    const id=this.lookupContext.getStore();
+    if(id) {
+      const original=voiceInput.parse(this.journal.input(id,this.journal.operationCall(id)));
+      if(original.action==="preflight") {
+        const deadline=this.journal.checkpoint(`preflight-operation:${id}`)?.deadline_at;
+        if(Number.isFinite(deadline) && Date.now()>=deadline)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
+        const controller=this.preflightControllers.get(id);
+        const deadlineAt=Number.isFinite(deadline) ? Math.min(control.deadlineAt ?? deadline,deadline):control.deadlineAt;
+        control={...control,signal:control.signal ?? controller?.signal,deadlineAt};
+      }
+    }
+    return this.rawRun(query,variables,maxCost,control);
+  };
   directoryHealth(): Record<string,unknown> {return this.directory.status();}
   inputNeverJournaled(id: unknown): boolean {return typeof id !== "string" || !this.journal.hasOperation(id);}
   async tick():Promise<void> { for(const op of this.journal.pending()) if(!this.jobs.has(op.id))void this.launch(voiceInput.parse(this.journal.input(op.id,op.call))); }
   /** Private HTTP dispatch is always quick; the journal owns unfinished work. */
   async dispatch(raw:unknown):Promise<VoiceResult> {
     const input=voiceInput.parse(raw);
-    if(input.action==="end_call") {if(!this.journal.checkpoint(`ended-call:${input.call_id}`))this.journal.setCheckpoint(`ended-call:${input.call_id}`,{ended_at:Date.now()});return {outcome:"completed",records:{}};}
+    if(input.action==="end_call") {
+      if(!this.journal.checkpoint(`ended-call:${input.call_id}`))this.journal.setCheckpoint(`ended-call:${input.call_id}`,{ended_at:Date.now()});
+      for(const controller of this.callControllers.get(input.call_id) || [])controller.abort(new WorkflowRequired("call_ended","none"));
+      return {outcome:"completed",records:{}};
+    }
     if(input.action==="prepare") return this.execute(input);
     if(input.action==="operation_status") {
       if(!input.operation_id)throw new Permanent("operation_id required");
@@ -104,13 +139,13 @@ export class VoiceService {
       if(result.outcome==="completed" && ["resolve","status","preflight","email_prepare"].includes(original.action)) {
         return this.deliverRead(original, result);
       }
-      if(["pending","uncertain"].includes(result.outcome) && (!result.retry_at || result.retry_at<=Date.now())) this.launch(voiceInput.parse(this.journal.input(input.operation_id,input.call_id)));
+      if(["pending","uncertain"].includes(result.outcome) && (this.preflightExpired(input.operation_id) || !result.retry_at || result.retry_at<=Date.now())) this.launch(voiceInput.parse(this.journal.input(input.operation_id,input.call_id)));
       return result;
     }
     if(!input.operation_id) input.operation_id=randomUUID();
     const saved=this.journal.start(input.operation_id,input.call_id,input);
     if(!["pending","uncertain"].includes(saved.outcome))return saved.outcome === "completed" && ["resolve","status","preflight","email_prepare"].includes(input.action) ? this.deliverRead(input,saved) : saved;
-    if(saved.retry_at && saved.retry_at>Date.now())return saved;
+    if(saved.retry_at && saved.retry_at>Date.now() && !this.preflightExpired(input.operation_id))return saved;
     const work=this.launch(input);
     let timer:ReturnType<typeof setTimeout>;
     const timeout=new Promise<VoiceResult>(resolve=>{timer=setTimeout(()=>{const result=this.journal.get(input.operation_id!,input.call_id);resolve({...result,...(result.outcome === "pending" && !result.retry_at ? {retry_at:Date.now()+1000}: {})});},2000);});
@@ -202,26 +237,40 @@ export class VoiceService {
     const id=input.operation_id!;
     const old=this.jobs.get(id);if(old)return old;
     if(!this.journal.claim(id))return Promise.resolve(this.journal.get(id,input.call_id));
+    if(input.action==="preflight" && !this.journal.checkpoint(`preflight-operation:${id}`))this.journal.setCheckpoint(`preflight-operation:${id}`,{started_at:Date.now(),deadline_at:Date.now()+PREFLIGHT_SCAN_DEADLINE_MS});
     const heartbeat=setInterval(()=>this.journal.renew(id),30000);heartbeat.unref();
+    const controller=new AbortController();
+    const controllers=this.callControllers.get(input.call_id);
+    const registered=input.action==="preflight";
+    const ownedControllers=controllers || new Set<AbortController>();
+    if(registered) { ownedControllers.add(controller);this.callControllers.set(input.call_id,ownedControllers);this.preflightControllers.set(id,controller); }
     const task=this.lookupContext.run(id,async()=>{
       let result:VoiceResult;
       try {
+        if(input.action==="preflight" && this.preflightExpired(id))throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
         const prior=this.journal.get(id,input.call_id);
         result=prior.outcome==="uncertain" ? await this.execute({action:"operation_status",operation_id:id,call_id:input.call_id,caller_number:input.caller_number}) : await this.execute(input);
       }catch(error){
+        if(input.action==="preflight" && this.preflightExpired(id)) {
+          result={operation_id:id,outcome:"completed",preflight_id:id,intake_fingerprint:fingerprint(input.intake),missing_fields:[],preflight_state:"staff_review",reason_code:"duplicate_check_incomplete",next_action:"staff_review",records:{}};
+        } else {
         const permanent=error instanceof Permanent || error instanceof WorkflowRequired || error instanceof JobberPermissionError || error instanceof JobberAuthenticationError;
         result=this.journal.get(id,input.call_id);result.outcome=permanent ? "failed":"pending";
         result.reason_code=error instanceof WorkflowRequired ? error.code:permanent ? "validation_or_authorization":readFailureReason(error);
         result.failed_step=input.action==="preflight" ? "preflight_discovery":"prerequisite_reads";
-        if(error instanceof WorkflowRequired){result.next_action=error.nextAction;result.choices=error.choices;}
-        result.retry_at=this.journal.retryAt(id);
+        if(error instanceof WorkflowRequired)result.next_action=error.nextAction;
+        if(Number.isFinite((error as any)?.retryAt))result.retry_at=Math.max(this.journal.retryAt(id),Number((error as any).retryAt));
+        else result.retry_at=this.journal.retryAt(id);
+        if(error instanceof WorkflowRequired)result.choices=error.choices;
+        }
       }
-      result.operation_id=id; this.journal.save(id,result);if(result.outcome==="completed")this.journal.clearScan(id);
+      result.operation_id=id; this.journal.save(id,result);if(result.outcome==="completed"){this.journal.clearScan(id);this.journal.deleteCheckpoint(`preflight-operation:${id}`);}
       if(["preflight","resolve","status","email_prepare"].includes(input.action))await appendAuditLog({account_id:this.accountId,service_session_id:"voice-service",tool:`voice_${input.action}`,args:{operation_id:id,call_id:input.call_id,reason_code:result.reason_code,stage:result.failed_step || result.preflight_state || "complete"},outcome:result.outcome==="completed" ? "success":"error"});
       return result;
-    }).finally(()=>{clearInterval(heartbeat);this.journal.release(id);this.jobs.delete(id);});
+    }).finally(()=>{clearInterval(heartbeat);this.journal.release(id);this.jobs.delete(id);if(registered){ownedControllers.delete(controller);if(this.preflightControllers.get(id)===controller)this.preflightControllers.delete(id);if(this.callControllers.get(input.call_id)===ownedControllers && !ownedControllers.size)this.callControllers.delete(input.call_id);}});
     this.jobs.set(id,task);return task;
   }
+  private preflightExpired(id:string):boolean { const deadline=this.journal.checkpoint(`preflight-operation:${id}`)?.deadline_at;return Number.isFinite(deadline) && Date.now()>=deadline; }
   private async scan(query:string,variables:Record<string,unknown>):Promise<any> {
     const id=this.lookupContext.getStore();
     if(id) {const original=voiceInput.parse(this.journal.input(id,this.journal.operationCall(id)));if(["resolve","preflight"].includes(original.action) && this.journal.checkpoint(`ended-call:${original.call_id}`))throw new WorkflowRequired("call_ended","none");}
@@ -355,6 +404,7 @@ export class VoiceService {
     try {
       const selected=await this.destination(input);
       if(!selected.client)await this.checkDuplicates(input);
+      this.assertPreflightActive(input.operation_id!,input.call_id);
       return {...base,preflight_state:"ready",destination:{...(selected.client ? {client_id:selected.client.id,name:selected.client.name}: {new_client:true,name:i!.company || i!.name}),...(selected.property ? {property_id:selected.property.id,address:[selected.property.street1,selected.property.street2,selected.property.city].filter(Boolean).join(", ")}:{new_property:true,address:[i!.street1,i!.street2,i!.city].filter(Boolean).join(", ")})},next_action:"read_back_and_confirm"};
     }catch(error){
       if(!(error instanceof WorkflowRequired))throw error;
@@ -372,14 +422,26 @@ export class VoiceService {
     const key=`duplicate-work:preflight:${fingerprint({account:this.accountId,call_id:input.call_id,caller_number:input.caller_number,
       name:i.name,company:i.company,callback_number:i.callback_number,email:i.email,
       street1:i.street1,street2:i.street2,city:i.city,province:i.province,postal_code:i.postal_code})}`;
-    let work=this.preflightDuplicateChecks.get(key);
-    if(!work) {
-      work=this.scanDuplicates(input,key).finally(()=>{
-        if(this.preflightDuplicateChecks.get(key)===work)this.preflightDuplicateChecks.delete(key);
+    let entry=this.preflightDuplicateChecks.get(key);
+    if(entry?.expiresAt && entry.expiresAt<=Date.now()){this.preflightDuplicateChecks.delete(key);entry=undefined;}
+    if(!entry) {
+      for(const [oldKey,value] of this.preflightDuplicateChecks)if(value.expiresAt && value.expiresAt<=Date.now()){if(value.timer)clearTimeout(value.timer);this.preflightDuplicateChecks.delete(oldKey);}
+      const completed=[...this.preflightDuplicateChecks.entries()].filter(([,value])=>value.expiresAt).sort((a,b)=>(a[1].expiresAt||0)-(b[1].expiresAt||0));
+      while(completed.length>=128){const [oldKey,value]=completed.shift()!;if(value.timer)clearTimeout(value.timer);this.preflightDuplicateChecks.delete(oldKey);}
+      const created:{work:Promise<void>;expiresAt?:number;timer?:ReturnType<typeof setTimeout>}={work:Promise.resolve()};
+      created.work=this.scanDuplicates(input,key).then(()=>{
+        created.expiresAt=Date.now()+PREFLIGHT_RESULT_REUSE_MS;
+        created.timer=setTimeout(()=>{if(this.preflightDuplicateChecks.get(key)===created)this.preflightDuplicateChecks.delete(key);},PREFLIGHT_RESULT_REUSE_MS);
+        created.timer.unref?.();
+      }).catch(error=>{
+        if(created.timer)clearTimeout(created.timer);
+        if(this.preflightDuplicateChecks.get(key)===created)this.preflightDuplicateChecks.delete(key);
+        throw error;
       });
-      this.preflightDuplicateChecks.set(key,work);
+      this.preflightDuplicateChecks.set(key,created);
+      entry=created;
     }
-    return work;
+    return entry.work;
   }
   private async scanDuplicates(input:VoiceInput,key:string):Promise<void> {
     const i=input.intake!;
@@ -388,8 +450,19 @@ export class VoiceService {
     // pass always goes to Jobber and never relies on parent updatedAt timestamps.
     let state=this.journal.checkpoint(key);
     if(state?.pass>=2)state=undefined;
-    state=state?.version===2 ? state:{version:2,generation:randomUUID(),active_ms:0,pass:0,started_at:Date.now()};
+    const now=Date.now();
+    const operationDeadline=input.action==="preflight" ? this.journal.checkpoint(`preflight-operation:${input.operation_id}`)?.deadline_at:undefined;
+    state=state?.version===2 ? state:{version:2,generation:randomUUID(),active_ms:0,pass:0,started_at:now,deadline_at:operationDeadline ?? now+PREFLIGHT_SCAN_DEADLINE_MS};
+    if(Number.isFinite(operationDeadline))state.deadline_at=Math.min(state.deadline_at,operationDeadline);
+    if(!Number.isFinite(state.deadline_at))state.deadline_at=Date.now()+PREFLIGHT_SCAN_DEADLINE_MS;
+    this.journal.setCheckpoint(key,state);
     const started=Date.now();
+    const signal=input.action==="preflight" ? this.preflightControllers.get(input.operation_id!)?.signal:undefined;
+    const controlledRun:RunQuery=(query,variables,maxCost)=>this.run(query,variables,maxCost,{signal,deadlineAt:state.deadline_at});
+    const ensureWithinCall=()=>{
+      if(input.action==="preflight" && this.journal.checkpoint(`ended-call:${input.call_id}`))throw new WorkflowRequired("call_ended","none");
+      if(Date.now()>=state.deadline_at)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
+    };
     const check=(c:any)=>{
       const names=[normalizedText(i.company || i.name),normalizedText(i.name)];
       const numbers=[normalizePhone(i.callback_number),normalizePhone(input.caller_number)].filter(Boolean);
@@ -398,7 +471,8 @@ export class VoiceService {
       if(duplicate)throw new WorkflowRequired("potential_duplicate","staff_review");
     };
     try {
-      if(state.active_ms>=600000)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
+      if(state.retry_at>Date.now())throw new BudgetUnavailableError(Math.ceil((state.retry_at-Date.now())/1000),state.retry_at,"provider_throttled");
+      if(Date.now()>=state.deadline_at || state.active_ms>=60000)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
       if(state.started_at<Date.now()-600000)throw new WorkflowRequired("duplicate_check_stale","staff_review");
       if(state.pass===0) {
         const metadata=this.journal.checkpoint(`directory-metadata:${this.accountId}`);
@@ -415,22 +489,48 @@ export class VoiceService {
       }
       while(state.pass<2) {
         const scanKey=`${key}:${state.generation}:${state.pass}`;
-        await new VoiceCensus(this.journal,this.run).scan(scanKey,check,()=>{
-          if(input.action==="preflight" && this.journal.checkpoint(`ended-call:${input.call_id}`))throw new WorkflowRequired("call_ended","none");
-          if(state.active_ms+Date.now()-started>=600000)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
-        });
+        await new VoiceCensus(this.journal,controlledRun).scan(scanKey,check,ensureWithinCall);
         state.pass++;
+        delete state.retry_at;
         this.journal.setCheckpoint(key,state);
         this.journal.deleteCheckpoint(scanKey);
       }
+    }catch(error){
+      if(Date.now()>=state.deadline_at || state.active_ms + Date.now()-started>=60000)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
+      if(error instanceof BudgetUnavailableError || error instanceof RequestRateLimitError){
+        state.retry_at=Number((error as any).retryAt) || this.journal.retryAt(input.operation_id || "");
+        if(state.retry_at>=state.deadline_at)throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
+      }
+      throw error;
     }finally{state.active_ms+=Date.now()-started;this.journal.setCheckpoint(key,state);}
   }
   private async fresh(number: string | null, clientId: string): Promise<Match> {
     if (!number) throw new Permanent("Caller phone is not matched");
-    const c = (await this.run(clientQuery, { id: clientId }, 1500)).client;
-    const m = c && await this.lookupContext.run("",()=>this.match(c, number,true));
+    const read=async()=>{
+      const c = (await this.run(clientQuery, { id: clientId }, 1500)).client;
+      return c && await this.lookupContext.run("",()=>this.match(c, number,true));
+    };
+    const operationId=this.lookupContext.getStore();
+    if(operationId) {
+      const original=voiceInput.parse(this.journal.input(operationId,this.journal.operationCall(operationId)));
+      if(original.action==="preflight") {
+        const deadline=this.journal.checkpoint(`preflight-operation:${operationId}`)?.deadline_at;
+        const controller=this.preflightControllers.get(operationId);
+        const control:AdmissionControl={...(controller ? {signal:controller.signal}:{}),...(Number.isFinite(deadline) ? {deadlineAt:deadline}: {})};
+        return this.preflightReadContext.run({operationId,callId:original.call_id,control},read).then(m=>{
+          this.assertPreflightActive(operationId,original.call_id);
+          if(!m)throw new Permanent("Caller phone is not matched");
+          return m;
+        });
+      }
+    }
+    const m=await read();
     if (!m) throw new Permanent("Caller phone is not matched");
     return m;
+  }
+  private assertPreflightActive(operationId:string,callId:string):void {
+    if(this.journal.checkpoint(`ended-call:${callId}`) || this.preflightControllers.get(operationId)?.signal.aborted)throw new WorkflowRequired("call_ended","none");
+    if(this.preflightExpired(operationId))throw new WorkflowRequired("duplicate_check_incomplete","staff_review");
   }
   private allowed(m: Match, propertyId?: string): boolean { return !m.propertyIds || (!!propertyId && m.propertyIds.has(propertyId)); }
   private accessScope(m:Match):string {

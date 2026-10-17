@@ -4,7 +4,7 @@ import {DirectoryIncomplete} from "./census.js";
 
 /** Fixed, non-private reasons only; never return provider messages or variables. */
 export function readFailureReason(error:unknown):string {
-  if(error instanceof BudgetUnavailableError)return "budget_refilling";
+  if(error instanceof BudgetUnavailableError)return error.reasonCode;
   if(error instanceof RequestRateLimitError)return "request_rate_limited";
   if(error instanceof JobberAuthenticationError)return "account_or_authentication";
   if(error instanceof DirectoryIncomplete)return "incomplete_response";
