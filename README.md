@@ -29,6 +29,38 @@ Foundation reads are `search_records`, `get_record`, `catalog_search`, and
 `team_list`. They cover clients, properties, requests, quotes, jobs, invoices,
 visits, products/services, and assignable users.
 
+`list_tasks` and `get_task` expose native tasks with schedules, assignments,
+links and a content-derived `task_version`. The `scheduling` capability enables
+approval-required `create_task` and `update_task` for non-recurring tasks. Use
+explicit anytime (all-day), timed or unscheduled schedules; timezone defaults to
+America/Toronto. Optional client/property links are checked against this account.
+Assignment emails require `notify_team: true` (default false); they are not SMS
+and delivery is not verified. Timed assigned tasks may request a supported team
+reminder. Updates require `expected_task_version`, preserve omitted fields and
+reject completed/recurring tasks. No task deletion, completion or recurrence
+editing is exposed. Creation scans for identical tasks, blocks incomplete scans,
+and never retries an ambiguous mutation. Returned IDs remain available when
+readback fails or Jobber reports partial errors.
+
+Job reads include `jobType` and billing information. `create_job` defaults to
+`job_type: ONE_OFF`, with `FIXED_PRICE` / `ON_COMPLETION` billing. This native
+combination was verified through an explicitly authorized internal live probe;
+there is no explicit job-type field in Jobber's creation input. Other one-off
+billing combinations remain unavailable until verified. Jobs start unscheduled,
+without visits, assignments, team notification or review-request SMS. Create
+explicitly requested visits separately. Several visits do not imply recurrence.
+An explicit `RECURRING` choice requires explicit `VISIT_BASED` billing and a
+non-periodic billing schedule; periodic scheduling is outside this tool.
+
+The title is required for complete duplicate checking, bounded at 500 property
+jobs; incomplete scans block mutation. Source quote/request relationships are
+checked before creation. Only `outcome: created` confirms readback of the type,
+billing, destination/source, title, instructions, line items and unscheduled state.
+Partial or ambiguous responses preserve returned IDs and reconcile through reads
+without repeating the mutation. Candidates found after a timeout are evidence
+to review, not proof of successful creation. Never automatically convert, delete
+or recreate a mismatched job. See [the creation contract](docs/ONE_OFF_CONTRACT.md).
+
 `list_notes` returns paginated, versioned notes for clients, requests, quotes,
 jobs, and invoices. With `records` enabled, `create_note` and `update_note`
 create or edit text, pinned state, and supported record links after approval.
@@ -91,7 +123,8 @@ Set `JOBBER_CLIENT_ID` and `JOBBER_CLIENT_SECRET`, then ask the MCP host to run
 `authenticate`. OAuth tokens are AES-256-GCM encrypted under
 `JOBBER_STATE_DIR`, or `~/.jobber-mcp/` when that variable is unset. Container
 deployments must mount `JOBBER_STATE_DIR` on persistent storage and provide a
-stable `ENCRYPTION_KEY`. OAuth tokens and the audit log both live under that
+stable vault-supplied `ENCRYPTION_KEY`. Managed state fails closed without it;
+keys supplied through the environment are never copied into OS Keychain. OAuth tokens and the audit log both live under that
 directory. Never commit tokens, client secrets, or an `.env` file.
 
 The included container image runs the authenticated streamable-HTTP transport.
@@ -119,3 +152,125 @@ npm run verify:no-secrets
 This repository is GitHub-source-only today. It deliberately has no MCP
 registry `server.json` entry until the `@pineapplecare/jobber-mcp` package is
 actually published.
+
+## Private Williams voice API
+
+The optional HTTP surface is separate from staff MCP tools and approvals. Enable
+with `JOBBER_VOICE_ENABLED=true`, `JOBBER_VOICE_API_KEY` (at least 32 characters,
+different from `MCP_API_KEY`), `JOBBER_VOICE_ACCOUNT_ID`, `JOBBER_STATE_DIR` and
+vault-supplied `ENCRYPTION_KEY`. Requires Node 22.13 or newer (`node:sqlite`);
+the pinned container runtime supports it. Keep the port on loopback/Tailscale,
+never a public ingress. The voice credential cannot authenticate MCP requests.
+
+`POST /voice/v1/execute` accepts these fixed actions with `call_id` and original
+`caller_number`: `resolve`, `status`, `prepare`, `preflight`, `submit`, `message`,
+`email_prepare`, `contact_email`, `operation_status`, and the server-only `end_call`. Ermine supplies identity from signed active inbound call state;
+this is a trusted service interface, not a browser/customer endpoint. The
+connector verifies the configured account before any action, and again before
+external mutations. It never accepts arbitrary GraphQL or a tenant selector.
+See [the Ermine release contract](https://github.com/PineappleCare/ermine/blob/master/docs/WILLIAMS_JOBBER_VOICE.md)
+for the intake shape, deployment order and acceptance procedure.
+
+`submit`/`message`/`contact_email` require caller confirmation and a UUID `operation_id`. Bind the
+ID to the full immutable payload and call. The SQLite journal in
+`JOBBER_STATE_DIR/voice-operations.db` records dispatch before every mutation,
+returned IDs and verified readbacks. Retries return the recorded result. Uncertain
+writes are reconciled through reads; verified steps may resume undispatched work.
+Missing evidence remains uncertain for staff review, with no blind mutation replay.
+This is not an exactly-once claim across network or process failures.
+
+New work creates a Request and intake Note, then an Assessment only with a known
+property. Assessments have no start/end time, assigned users or team notification.
+Scheduling preferences remain in the Note. No Jobs, Visits, appointments, prices,
+status changes or customer notifications are created by this surface. Optional
+email, single names and incomplete locations are preserved without invented fields.
+
+`GET /voice/v1/health` requires the voice bearer and returns aggregate operation
+outcomes and directory refresh progress/failure classifications, without client
+data. `scripts/voice-fixture.mjs` is a loopback-only fake
+Jobber backend for Ermine's opt-in cross-repository test; it isolates all audit and
+OAuth state from the developer's home directory and Keychain. Mock verification
+and schema validation do not replace testing scopes and writes on a Jobber test account.
+
+Voice HTTP dispatch returns completed results or durable pending IDs within two
+seconds. A background worker resumes pending/uncertain operations from the journal;
+safe prerequisite read failures remain pending instead of becoming permanent write
+failures. Read-only resolve/status operations are also journaled and freshly
+reauthorized when polled. Per-operation scan checkpoints preserve completed pages.
+The complete, account-scoped SQLite phone directory refreshes in the background,
+including property-level contacts. It provides discovery candidates only; phone,
+record membership and property restrictions are reread before disclosure/writes.
+An index miss never authorizes new-client creation: complete duplicate checks still
+run before creation. `/voice/v1/health` includes directory completeness, refresh and
+failure timestamps. All new tables are additive and must survive rollback.
+
+Completed reads remain in the journal when polled. Delivery rechecks account,
+caller phones, property restrictions and selected record membership; it does not
+restart full discovery. Slow authorization has one in-flight check and a one-use
+handoff expiring after two seconds. Pending replies include `retry_at`; callers
+must poll promptly to consume a completed check. Expired checks and process
+restarts require fresh authorization.
+
+Schema rejection returns `failed` / `invalid_input` with `invalid_fields`.
+`submission_rejected: true` is returned only when the operation ID never entered
+the connector journal. Existing IDs cannot use that marker to bypass recovery.
+Explicit mutation validation errors with no returned record are stored as
+`rejected` steps and settle as failed/partial with error details. Transport loss,
+missing responses and top-level execution errors retain uncertainty. Rejected
+steps survive restarts and are never redispatched. Index account-check failures
+are included in refresh health reporting.
+
+Current Ermine submissions bind a ready preflight to the exact intake revision,
+caller and selected destination. Corrections invalidate readiness. Assessments
+default to false and require explicit on-site intent; propertyless Requests remain
+disabled until their API behavior is verified. Phone-index candidates are freshly
+authorized and returned for explicit destination selection without a directory
+scan. An index miss stays unresolved; it never establishes a new customer.
+
+Duplicate checks use a complete background generation from the last five minutes
+as a baseline, then perform a fresh, resumable account census before a new-client
+decision. Without that baseline, both passes are fresh. Every pass includes
+property contacts independently of client timestamps. Client pages contain the
+first contact and paginate all overflow contact, phone, email and property
+connections; accounts with zero/one-contact clients no longer need one separate
+HTTP request per client. The pinned API requested cost was measured as 885 for a
+20-client page (900 reserved), with no writes during that measurement. Neither a
+partial census nor a census older than ten minutes permits creation. Transient
+background refresh failures resume after 15 seconds, preserving the last complete
+index and saved progress. Worker leases, due times and
+15-second to five-minute reconciliation backoff protect pending/uncertain writes.
+Concurrent preflight reads share an in-flight census only when account, call,
+caller and every field used by the duplicate predicate match. Description-only
+corrections retain separate immutable preflight receipts; submission still runs
+its own fresh census before a client can be created.
+The staff MCP interface and approval contract remain unchanged.
+
+Customer status is projected through an allowlist: names and relevant contact
+details, authorized service addresses, titles, reviewed status wording and recorded
+Visit/Assessment timing. Completed visits require `include_history:true`; no
+visit found, unscheduled, date-only and unavailable timing remain distinct. Each
+appointment's own client/property/parent is checked. Contact-owned phone matches
+retain the matched contact IDs and property restrictions rather than granting
+client-wide access. Internal notes, line items and financial states are excluded.
+
+`email_prepare` returns a freshly authorized destination, consequences and a
+fingerprint of the complete current email collection. `contact_email` binds that
+fingerprint to the confirmed immutable proposal: `client_id`, optional `contact_id`,
+`address`, explicit `make_primary`, and `intended_use` (`contact` or `invoices`).
+It appends or promotes through narrowly defined `clientEdit` fields, preserves
+every prior address and verifies readback. Contact-only callers can update only
+their own matched contact. First-email primary behavior is disclosed before
+confirmation. Invoice intent is retained for staff where recipient changes are
+needed; no invoice, billing role, portal, notification or consent is changed.
+An uncertain email write remains journaled for reconciliation, never blind replay.
+
+## Private contact synchronization API
+
+`JOBBER_CONTACT_SYNC_ENABLED=true` exposes fixed paginated client/contact/email/phone
+reads at `GET /contact-sync/v1/page?kind=clients`. Configure a separate
+`JOBBER_CONTACT_SYNC_API_KEY` (at least 32 characters), pinned
+`JOBBER_CONTACT_SYNC_ACCOUNT_ID`, and existing persistent `JOBBER_STATE_DIR`.
+The service credential cannot authenticate `/mcp` or the voice API. Browser origins
+and arbitrary operations are rejected. No Jobber mutation is available. Keep this
+route on the private Docker network. Only the Williams contact worker receives its
+service credential; the connector remains the sole owner of OAuth/refresh state.

@@ -166,17 +166,17 @@ function redactArgs(args: Record<string, unknown>): Record<string, unknown> {
 }
 
 export async function appendAuditLog(
-  entry: Omit<AuditEntry, "timestamp" | "session_id" | "machine_ip" | "account_id"> & { account_id?: string; result_count?: number }
+  entry: Omit<AuditEntry, "timestamp" | "session_id" | "machine_ip" | "account_id"> & { account_id?: string; result_count?: number; service_session_id?: string }
 ): Promise<void> {
   try {
     const { directory, file } = auditPaths();
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     await fs.chmod(directory, 0o700).catch(() => {});
 
-    const ctx = requireSessionContext();
+    const ctx = entry.service_session_id && entry.account_id ? null : requireSessionContext();
     // `""` is http.ts's initialize-request placeholder sessionId, never a real one - `||` (not
     // `??`) treats it as absent so it doesn't get persisted as a bogus session_id.
-    const session_id = ctx?.sessionId || STDIO_SESSION_ID;
+    const session_id = entry.service_session_id || ctx?.sessionId || STDIO_SESSION_ID;
 
     let account_id = entry.account_id;
     if (!account_id) {

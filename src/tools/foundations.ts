@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { registerCreateJob } from "./jobs.js";
+import { lineItemSchema } from "./job-line-items.js";
 import { registerCreateDraftInvoice } from "./invoices.js";
 import { registerJobLineItemDescriptions } from "./job-line-item-descriptions.js";
 import { noteFields, recordWithNoteVersions } from "./notes.js";
@@ -23,14 +25,6 @@ const addressSchema = z.object({
 });
 const emailSchema = z.object({ address: z.string().trim().email().max(320), primary: z.boolean().default(false) });
 const phoneSchema = z.object({ number: z.string().trim().min(3).max(40), primary: z.boolean().default(false) });
-const lineItemSchema = z.object({
-  name: z.string().trim().min(1).max(250),
-  description: z.string().trim().max(4000).optional(),
-  quantity: z.number().positive().max(100000).default(1),
-  unit_price: z.number().finite().min(0).max(1_000_000),
-  taxable: z.boolean().optional(),
-  product_or_service_id: z.string().trim().min(1).optional(),
-});
 const confirmSchema = z.literal(true).describe("Must be true after reviewing the proposed external change");
 
 type Node = Record<string, any>;
@@ -40,7 +34,7 @@ const clientFields = `${summaryFields} name firstName lastName companyName email
 const propertyFields = `id name street1 street2 city province postalCode country jobberWebUri`;
 const requestFields = `${summaryFields} title requestStatus createdAt client { id name } property { id name }`;
 const quoteFields = `${summaryFields} quoteNumber title quoteStatus sentAt message amounts { total } client { id name } property { id name }`;
-const jobFields = `${summaryFields} jobNumber title jobStatus instructions total client { id name } property { id name } quote { id } request { id }`;
+const jobFields = `${summaryFields} jobNumber title jobType jobStatus instructions total billingType invoiceSchedule{billingFrequency} client { id name } property { id name } quote { id } request { id }`;
 const invoiceFields = `${summaryFields} invoiceNumber subject invoiceStatus issuedDate dueDate receivedDate amounts { total invoiceBalance } client { id name }`;
 const visitFields = `id title visitStatus isComplete completedAt allDay startAt endAt instructions job { id jobNumber title } client { id name } assignedUsers(first: 20) { nodes { id name { full } } }`;
 
@@ -67,9 +61,6 @@ function addressToJobber(address: z.infer<typeof addressSchema>) {
   return { street1: address.street1, street2: address.street2, city: address.city, province: address.province, postalCode: address.postal_code, country: address.country };
 }
 function linesToQuote(lines: z.infer<typeof lineItemSchema>[]) {
-  return lines.map((line) => ({ name: line.name, description: line.description, quantity: line.quantity, unitPrice: line.unit_price, taxable: line.taxable, productOrServiceId: line.product_or_service_id, saveToProductsAndServices: false }));
-}
-function linesToJob(lines: z.infer<typeof lineItemSchema>[]) {
   return lines.map((line) => ({ name: line.name, description: line.description, quantity: line.quantity, unitPrice: line.unit_price, taxable: line.taxable, productOrServiceId: line.product_or_service_id, saveToProductsAndServices: false }));
 }
 function normalized(value: unknown): string {
@@ -308,23 +299,7 @@ function registerQuoteJobInvoiceWrites(server: McpServer): void {
     if (args.title === undefined && args.message === undefined && args.contract_disclaimer === undefined) throw new Error("Provide at least one quote field to update.");
     const data = await run<Node>(`mutation EditQuote($quoteId:EncodedId!,$attributes:QuoteEditAttributes!){quoteEdit(quoteId:$quoteId,attributes:$attributes){quote{${quoteFields}} userErrors{message path}}}`, { quoteId: args.quote_id, attributes: { title: args.title, message: args.message, contractDisclaimer: args.contract_disclaimer } }); const quote = mutationRecord("updating draft quote", data, "quoteEdit", "quote"); await audit("update_draft_quote", args, quote); return response("updated", "quote", quote);
   });
-  registerWriteTool(server, "create_job", { description: "Create a Jobber fixed-price or visit-based job from a property and optional request or quote.", capability: "records", inputSchema: { property_id: z.string().min(1), quote_id: z.string().min(1).optional(), request_id: z.string().min(1).optional(), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), billing_type: z.enum(["FIXED_PRICE", "VISIT_BASED"]), billing_schedule: z.enum(["ON_COMPLETION", "PERIODIC", "PER_VISIT", "NEVER"]), line_items: z.array(lineItemSchema).max(100).default([]), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
-    if (args.quote_id && args.request_id) throw new Error("Choose either a source quote or source request, not both.");
-    const source = await run<Node>(`query JobPreflight($propertyId:EncodedId!){property(id:$propertyId){id client{id} jobs(first:50){nodes{id title jobStatus}}}}`, { propertyId: args.property_id });
-    assertRelationship(source.property, "Property not found; no job was created.");
-    if (args.quote_id) {
-      const quoteSource = await run<Node>(`query QuoteForJob($id:EncodedId!){quote(id:$id){id property{id} client{id} jobs(first:1){nodes{id}}}}`, { id: args.quote_id });
-      assertRelationship(quoteSource.quote?.property?.id === args.property_id && quoteSource.quote?.client?.id === source.property.client.id, "Quote does not belong to the selected property and client; no job was created.");
-      assertRelationship(quoteSource.quote.jobs.nodes.length === 0, "The source quote already has a job; no duplicate job was created.");
-    }
-    if (args.request_id) {
-      const requestSource = await run<Node>(`query RequestForJob($id:EncodedId!){request(id:$id){id property{id} client{id} jobs(first:1){nodes{id}} requestStatus}}`, { id: args.request_id });
-      assertRelationship(requestSource.request?.property?.id === args.property_id && requestSource.request?.client?.id === source.property.client.id, "Request does not belong to the selected property and client; no job was created.");
-      assertRelationship(requestSource.request.jobs.nodes.length === 0 && normalized(requestSource.request.requestStatus) !== "archived", "The source request is archived or already has a job; no duplicate job was created.");
-    }
-    if (args.title && source.property.jobs.nodes.some((job: Node) => normalized(job.title) === normalized(args.title) && !["closed", "archived"].includes(normalized(job.jobStatus)))) throw new Error("A matching active job already exists at this property; no job was created.");
-    const data = await run<Node>(`mutation CreateJob($input:JobCreateAttributes!){jobCreate(input:$input){job{${jobFields}} userErrors{message path}}}`, { input: { propertyId: args.property_id, quoteId: args.quote_id, requestId: args.request_id, title: args.title, instructions: args.instructions, lineItems: linesToJob(args.line_items), invoicing: { invoicingType: args.billing_type, invoicingSchedule: args.billing_schedule }, scheduling: { createVisits: false, notifyTeam: false } } }); const job = mutationRecord("creating job", data, "jobCreate", "job"); await audit("create_job", args, job); return response("created", "job", job);
-  });
+  registerCreateJob(server);
   registerJobLineItemDescriptions(server);
   registerWriteTool(server, "update_job", { description: "Update title or instructions on a reviewed Jobber job.", capability: "records", inputSchema: { job_id: z.string().min(1), expected_updated_at: z.string().min(1), title: z.string().trim().max(250).optional(), instructions: z.string().trim().max(10000).optional(), confirm_write: confirmSchema }, maxCost: WRITE_COST }, async (args: any, run) => {
     const current = await run<Node>(`query JobVersion($id:EncodedId!){job(id:$id){updatedAt}}`, { id: args.job_id }); if (current.job?.updatedAt !== args.expected_updated_at) throw new Error("Job changed since it was reviewed; fetch it again before updating."); if (args.title === undefined && args.instructions === undefined) throw new Error("Provide a title or instructions to update."); const data = await run<Node>(`mutation EditJob($jobId:EncodedId!,$input:JobEditInput!){jobEdit(jobId:$jobId,input:$input){job{${jobFields}} userErrors{message path}}}`, { jobId: args.job_id, input: { title: args.title, instructions: args.instructions } }); const job = mutationRecord("updating job", data, "jobEdit", "job"); await audit("update_job", args, job); return response("updated", "job", job);
@@ -365,7 +340,7 @@ function timezoneFormatter(timezone: string): Intl.DateTimeFormat {
   return formatter;
 }
 
-function localInstant(date: string, time: string, timezone: string, label: string): number {
+export function localInstant(date: string, time: string, timezone: string, label: string): number {
   const [year, month, day] = date.split("-").map(Number);
   const parts = time.split(":").map(Number);
   const [hour, minute, second = 0] = parts;
@@ -385,7 +360,7 @@ function localInstant(date: string, time: string, timezone: string, label: strin
   return unique[0];
 }
 
-function calendarDateInTimezone(value: unknown, timezone: string): string | undefined {
+export function calendarDateInTimezone(value: unknown, timezone: string): string | undefined {
   if (typeof value !== "string" || !value) return undefined;
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
   const instant = Date.parse(value);
@@ -488,7 +463,7 @@ async function loadVisitPreflight(jobId: string, run: any): Promise<{ job: Node 
   throw new Error("The job has too many visits to safely complete duplicate checking; no write was attempted.");
 }
 
-async function assertSchedulableUsers(requestedIds: string[], run: any): Promise<void> {
+export async function assertSchedulableUsers(requestedIds: string[], run: any): Promise<void> {
   let cursor: string | undefined;
   let complete = false;
   const users = new Map<string, Node>();

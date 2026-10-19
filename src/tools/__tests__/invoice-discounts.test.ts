@@ -116,7 +116,7 @@ describe("draft invoice discounts", () => {
     const { configs } = setup();
     for (const name of ["create_draft_quote", "create_job"]) {
       const result = await configs[name].inputSchema["~standard"].validate({
-        client_id: "client-1", property_id: "property-1", line_items: [lines[2]],
+        client_id: "client-1", property_id: "property-1", title: "Work", line_items: [lines[2]],
         billing_type: "FIXED_PRICE", billing_schedule: "ON_COMPLETION", confirm_write: true,
       });
       expect(result.issues).toBeDefined();

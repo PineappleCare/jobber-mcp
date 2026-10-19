@@ -1,5 +1,9 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
+import { jobberGraphQL, jobberGraphQLWrite } from "../jobber/client.js";
+import { registerContactSyncRoutes } from "../contact-sync/http.js";
+import { registerVoiceRoutes } from "../voice/http.js";
+import { VoiceService } from "../voice/service.js";
 import { setCookie, getCookie, deleteCookie } from "hono/cookie";
 import { readFileSync } from "fs";
 import { randomUUID, timingSafeEqual, createHash } from "crypto";
@@ -173,6 +177,36 @@ function requireApiKey(req: Request): Response | null {
 }
 
 export const app = new Hono();
+
+// Optional private service surface. Staff MCP registration/approval is unchanged.
+if (process.env.JOBBER_VOICE_ENABLED === "true") {
+  const key = process.env.JOBBER_VOICE_API_KEY || "";
+  const account = process.env.JOBBER_VOICE_ACCOUNT_ID || "";
+  if (key.length < 32 || key === process.env.MCP_API_KEY || !account || !process.env.JOBBER_STATE_DIR) throw new Error("Voice API requires separate credential, account and persistent state");
+  const { VoiceJournal } = await import("../voice/journal.js");
+  const record = { tokens: null, accountId: undefined, refreshInFlight: null } as SessionRecord;
+  const context = buildSessionContext(record, "voice-service");
+  const service = new VoiceService(new VoiceJournal(`${process.env.JOBBER_STATE_DIR}/voice-operations.db`),
+    (query, variables, maxCost = 1000, control) => sessionStorage.run(context, () =>
+      query.trim().startsWith("mutation") ? jobberGraphQLWrite(query, variables, maxCost, control) : jobberGraphQL(query, variables, maxCost, control)), account);
+  registerVoiceRoutes(app, service, key);
+  setInterval(()=>{void sessionStorage.run(context,()=>service.tick()).catch(()=>{});},1000).unref();
+  // Resume saved census pages promptly after transient failure, instead of
+  // pausing an incomplete index for the full five-minute refresh interval.
+  const refresh=()=>{void sessionStorage.run(context,()=>service.directory.refresh()).then(
+    ()=>{setTimeout(refresh,5*60*1000).unref();},
+    (error)=>{const retryAt=Number(error?.retryAt);const delay=Math.max(15000,Number.isFinite(retryAt) ? retryAt-Date.now():0);setTimeout(refresh,delay).unref();});};
+  refresh();
+}
+
+if (process.env.JOBBER_CONTACT_SYNC_ENABLED === "true") {
+  if (!process.env.JOBBER_STATE_DIR) throw new Error("Contact sync requires persistent Jobber OAuth state");
+  const record = { tokens: null, accountId: undefined, refreshInFlight: null } as SessionRecord;
+  const context = buildSessionContext(record, "contact-sync-service");
+  registerContactSyncRoutes(app,
+    (query, variables, maxCost) => sessionStorage.run(context, () => jobberGraphQL(query, variables, maxCost)),
+    process.env.JOBBER_CONTACT_SYNC_API_KEY || "", process.env.JOBBER_CONTACT_SYNC_ACCOUNT_ID || "");
+}
 
 app.get("/health", (c) => c.json({ ok: true }));
 

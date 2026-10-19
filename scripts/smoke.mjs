@@ -28,6 +28,8 @@ const EXPECTED_TOOLS = [
   "list_notes",
   "catalog_search",
   "team_list",
+  "list_tasks",
+  "get_task",
 ];
 
 function send(child, message) {

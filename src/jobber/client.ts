@@ -1,7 +1,7 @@
 import { getValidAccessToken } from "../auth/oauth.js";
 import { requireSessionContext } from "../utils/sessionContext.js";
 import type { SessionContext } from "../utils/sessionContext.js";
-import { CostGovernor } from "./cost-governor.js";
+import { BudgetUnavailableError, CostGovernor, type AdmissionControl } from "./cost-governor.js";
 import { ACCOUNT_ID_QUERY } from "./queries.js";
 import {
   JobberApiError,
@@ -28,8 +28,14 @@ function getGraphqlUrl(): string {
 const MAX_THROTTLE_RETRIES = 1;
 const MAX_429_RETRIES = 3;
 const DEFAULT_429_BACKOFF_MS = [1000, 2000, 4000];
-const MAX_RETRY_AFTER_MS = 10_000;
+const MAX_READ_ATTEMPTS = 4;
 const REQUEST_TIMEOUT_MS = 30_000;
+// Staff tools preserve partial mutation data. Voice recovery must distinguish
+// native validation errors from top-level execution errors merged into that data.
+const mutationExecutionFailures = new WeakSet<object>();
+export function hasMutationExecutionErrors(data: unknown): boolean {
+  return data !== null && typeof data === "object" && mutationExecutionFailures.has(data);
+}
 const MAX_5XX_RETRIES = 2;
 const FIVE_XX_BACKOFF_MS = [1000, 2000];
 
@@ -45,6 +51,8 @@ const sessionGovernors = new Map<string, CostGovernor>();
 // closing one session on a shared account doesn't wipe the budget state a sibling session still
 // open on that account is relying on.
 const accountGovernors = new Map<string, { governor: CostGovernor; sessionIds: Set<string> }>();
+const accountResolutionInFlight = new Map<string, Promise<string | null>>();
+const accountResolutionRetryAt = new Map<string, number>();
 
 /** Exposed for tests: lets a test prime a session's (pre-account-resolution) budget before calling jobberGraphQL. */
 export function getGovernorForSession(sessionId: string | undefined): CostGovernor {
@@ -62,12 +70,15 @@ export function getGovernorForAccount(accountId: string): CostGovernor | undefin
   return accountGovernors.get(accountId)?.governor;
 }
 
-function getSharedAccountGovernor(accountId: string, sessionId: string): CostGovernor {
+function getSharedAccountGovernor(accountId: string, sessionId: string, seed?: CostGovernor): CostGovernor {
   let entry = accountGovernors.get(accountId);
   if (!entry) {
-    entry = { governor: new CostGovernor(), sessionIds: new Set() };
+    const governor = new CostGovernor();
+    if (seed) governor.seedFrom(seed);
+    entry = { governor, sessionIds: new Set() };
     accountGovernors.set(accountId, entry);
   }
+  if (seed) entry.governor.seedFrom(seed);
   entry.sessionIds.add(sessionId);
   return entry.governor;
 }
@@ -77,29 +88,36 @@ const ACCOUNT_ID_QUERY_COST = 1; // deliberately the cheapest possible query - s
 /**
  * Resolves the Jobber account id for a session so its governor can be shared with any other
  * session on the same account, instead of each session assuming it owns the account's full
- * budget. Best-effort and non-fatal: any failure (network, budget, malformed/rejected query)
- * is swallowed and reported as unresolved (null) rather than failing or delaying the caller's
- * real request - that request then simply keeps using its own per-session governor, exactly as
- * it did before this resolution existed.
+ * budget. Resolution failures are reported as unresolved (null); callers then fail closed until
+ * the shared account budget can be identified instead of dispatching on an isolated estimate.
  */
-async function resolveAccountId(ctx: SessionContext): Promise<string | null> {
+async function resolveAccountId(ctx: SessionContext, control: AdmissionControl): Promise<string | null> {
+  let admission: number | undefined;
+  const governor = getGovernorForSession(ctx.sessionId);
   try {
     const token = await ctx.getAccessToken();
-    const governor = getGovernorForSession(ctx.sessionId);
-    await governor.checkBudget(ACCOUNT_ID_QUERY_COST);
-    let costRecorded = false;
+    const tokenAccountId = ctx.getTokens()?.account_id;
+    if (tokenAccountId) return tokenAccountId;
+    admission = await governor.admit(ACCOUNT_ID_QUERY_COST, control);
     try {
-      const { status, body } = await postOnce(token, ACCOUNT_ID_QUERY, undefined);
-      if (body?.extensions?.cost) {
-        governor.recordCost(body.extensions.cost);
-        costRecorded = true;
+      const { status, body, retryAfterHeader } = await postOnce(token, ACCOUNT_ID_QUERY, undefined, control);
+      governor.settleAdmission(admission);
+      if (body?.extensions?.cost) governor.recordCost(body.extensions.cost, admission);
+      if (status === 429 || isThrottled(body)) {
+        if (!body?.extensions?.cost) governor.assumeDepleted();
+        const throttleWait = body?.extensions?.cost ? Math.max(1000, governor.backoffMsFor(body.extensions.cost.requestedQueryCost)) : DEFAULT_429_BACKOFF_MS[0];
+        governor.deferUntil(retryAfterAt(retryAfterHeader, throttleWait));
       }
       const id = body?.data?.account?.id;
+      if (status === 429 || isThrottled(body)) accountResolutionRetryAt.set(ctx.sessionId, governor.getCooldownUntil());
       return status === 200 && typeof id === "string" && id.length > 0 ? id : null;
-    } finally {
-      if (!costRecorded) governor.releaseReservation(ACCOUNT_ID_QUERY_COST);
+    } catch (error) {
+      governor.settleAdmission(admission);
+      throw error;
     }
   } catch (err: any) {
+    if (control.signal?.aborted) throw control.signal.reason ?? err;
+    accountResolutionRetryAt.set(ctx.sessionId, Math.max(Date.now() + 1000, Number(err?.retryAt) || 0));
     console.error(
       "[jobber] Could not resolve account id for cost-governor sharing; this session will budget independently:",
       err?.message ?? err
@@ -109,18 +127,43 @@ async function resolveAccountId(ctx: SessionContext): Promise<string | null> {
 }
 
 /** Picks (and, on a session's first call, resolves/caches) the governor to use for a request. */
-async function getGovernorForContext(ctx: SessionContext | null): Promise<CostGovernor> {
+async function getGovernorForContext(ctx: SessionContext | null, control: AdmissionControl): Promise<CostGovernor> {
   // "" is the http.ts initialize-request placeholder sessionId, never a real one - treat it as
   // absent (falsy `||`, not `??`) so it doesn't allocate a bogus session-keyed governor.
   const sessionId = ctx?.sessionId || undefined;
   if (ctx === null || sessionId === undefined) return stdioGovernor;
 
   let accountId = ctx.getAccountId();
-  if (accountId === undefined) {
-    accountId = await resolveAccountId(ctx);
-    ctx.setAccountId(accountId);
+  if (!accountId) {
+    // Tokens are issued by Jobber and carry the verified account identity. Load/refresh
+    // them before falling back to the inexpensive account query.
+    await ctx.getAccessToken();
+    accountId = ctx.getAccountId() ?? ctx.getTokens()?.account_id;
   }
-  return accountId ? getSharedAccountGovernor(accountId, sessionId) : getGovernorForSession(sessionId);
+  if (accountId) {
+    accountResolutionRetryAt.delete(sessionId);
+    ctx.setAccountId(accountId);
+    return getSharedAccountGovernor(accountId, sessionId, getGovernorForSession(sessionId));
+  }
+  if (!accountId) {
+    const blockedUntil = accountResolutionRetryAt.get(sessionId) || 0;
+    if (blockedUntil > Date.now()) throw new BudgetUnavailableError(Math.ceil((blockedUntil - Date.now()) / 1000), blockedUntil, "account_budget_unavailable");
+    let pending = accountResolutionInFlight.get(sessionId);
+    if (!pending) {
+      pending = resolveAccountId(ctx, control).finally(() => accountResolutionInFlight.delete(sessionId));
+      accountResolutionInFlight.set(sessionId, pending);
+    }
+    accountId = await pending;
+    if (accountId) ctx.setAccountId(accountId);
+  }
+  if (!accountId) {
+    const now = Date.now();
+    const retryAt = Math.max(now + 1000, accountResolutionRetryAt.get(sessionId) || 0);
+    accountResolutionRetryAt.set(sessionId, retryAt);
+    const reasonCode = retryAt > now + 1000 ? "provider_throttled" : "account_budget_unavailable";
+    throw new BudgetUnavailableError(Math.ceil((retryAt - now) / 1000), retryAt, reasonCode);
+  }
+  return getSharedAccountGovernor(accountId, sessionId, getGovernorForSession(sessionId));
 }
 
 /**
@@ -149,8 +192,34 @@ async function resolveAccessToken(ctx: SessionContext | null): Promise<string> {
   return getValidAccessToken();
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Request cancelled"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, ms);
+    const onAbort = () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); reject(signal?.reason ?? new Error("Request cancelled")); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function retryAfterAt(header: string | null | undefined, fallbackMs = 1000): number {
+  const value = header?.trim();
+  if (value) {
+    if (/^(?:\d+(?:\.\d+)?|\.\d+)$/.test(value)) return Date.now() + Number(value) * 1000;
+    if (/^-\d/.test(value)) return Date.now() + fallbackMs;
+    const date = Date.parse(value);
+    if (Number.isFinite(date)) return Math.max(Date.now(), date);
+  }
+  return Date.now() + fallbackMs;
+}
+
+function combineSignal(signal: AbortSignal | undefined, deadlineAt: number | undefined): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  const timeoutMs = Math.max(1, Math.min(REQUEST_TIMEOUT_MS, deadlineAt === undefined ? REQUEST_TIMEOUT_MS : deadlineAt - Date.now()));
+  const timer = setTimeout(() => controller.abort(new Error("Jobber request timed out")), timeoutMs);
+  const onAbort = () => controller.abort(signal?.reason ?? new Error("Request cancelled"));
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  return { signal: controller.signal, cleanup: () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); } };
 }
 
 interface RawGraphQLResponse {
@@ -163,9 +232,11 @@ interface RawGraphQLResponse {
 async function postOnce(
   token: string,
   query: string,
-  variables: Record<string, unknown> | undefined
+  variables: Record<string, unknown> | undefined,
+  control: AdmissionControl = {}
 ): Promise<RawGraphQLResponse> {
   let res: Response;
+  const request = combineSignal(control.signal, control.deadlineAt);
   try {
     res = await fetch(getGraphqlUrl(), {
       method: "POST",
@@ -175,19 +246,26 @@ async function postOnce(
         "X-JOBBER-GRAPHQL-VERSION": JOBBER_GRAPHQL_VERSION,
       },
       body: JSON.stringify({ query, variables }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: request.signal,
     });
+    let body: any = {};
+    let parseFailed = false;
+    try {
+      body = await res.json();
+    } catch (err: any) {
+      if (control.signal?.aborted) throw control.signal.reason ?? err;
+      if (request.signal.aborted) throw new JobberApiError("Jobber API response body timed out or was cancelled.");
+      parseFailed = true;
+    }
+    return { status: res.status, retryAfterHeader: res.headers.get("Retry-After"), body, parseFailed };
   } catch (err: any) {
+    if (control.signal?.aborted) throw control.signal.reason ?? err;
+    if (request.signal.aborted) throw new JobberApiError("Jobber API request timed out.");
+    if (err instanceof JobberApiError) throw err;
     throw new JobberApiError(`Jobber API request failed: ${err.message}`);
+  } finally {
+    request.cleanup();
   }
-  let body: any = {};
-  let parseFailed = false;
-  try {
-    body = await res.json();
-  } catch {
-    parseFailed = true;
-  }
-  return { status: res.status, retryAfterHeader: res.headers.get("Retry-After"), body, parseFailed };
 }
 
 function isThrottled(body: any): boolean {
@@ -226,25 +304,29 @@ async function executeGraphQL<T = any>(
   query: string,
   variables: Record<string, unknown> | undefined,
   maxCost: number,
-  isMutation: boolean
+  isMutation: boolean,
+  control: AdmissionControl = {}
 ): Promise<T> {
   const ctx = requireSessionContext();
-  const governor = await getGovernorForContext(ctx);
+  const governor = await getGovernorForContext(ctx, control);
   const token = await resolveAccessToken(ctx);
-
-  await governor.checkBudget(maxCost);
-
   let throttleRetries = 0;
   let rateLimitRetries = 0;
   let fiveXxRetries = 0;
-  let costRecorded = false;
+  let attempts = 0;
 
-  try {
-    for (;;) {
+  for (;;) {
+      if (!isMutation && attempts >= MAX_READ_ATTEMPTS) throw new JobberApiError("Jobber read exceeded its bounded retry attempts.");
+      const admission = await governor.admit(maxCost, control);
+      attempts++;
       let response: RawGraphQLResponse;
       try {
-        response = await postOnce(token, query, variables);
+        response = await postOnce(token, query, variables, control);
+        governor.settleAdmission(admission);
       } catch (error: any) {
+        // Fetch was dispatched. Its cost and request-count reservation stays spent even
+        // when a timeout or transport failure hides the provider response.
+        governor.settleAdmission(admission);
         if (isMutation) {
           throw new JobberOutcomeUncertainError(
             `${error.message} The write outcome is unknown; check Jobber before trying again.`
@@ -253,29 +335,33 @@ async function executeGraphQL<T = any>(
         throw error;
       }
       const { status, retryAfterHeader, body, parseFailed } = response;
+      if (body?.extensions?.cost) governor.recordCost(body.extensions.cost, admission);
 
       if (status === 429) {
+        const fallback = DEFAULT_429_BACKOFF_MS[Math.min(rateLimitRetries, DEFAULT_429_BACKOFF_MS.length - 1)];
+        const retryAt = retryAfterAt(retryAfterHeader, fallback);
+        governor.deferUntil(retryAt);
         if (isMutation) {
           throw new JobberOutcomeUncertainError(
             "Jobber rate-limited this write before a result was returned. Its outcome is unknown; check Jobber before trying again."
           );
         }
-        if (rateLimitRetries >= MAX_429_RETRIES) {
+        if (rateLimitRetries >= MAX_429_RETRIES || attempts >= MAX_READ_ATTEMPTS) {
           throw new JobberApiError("Jobber rate limit (HTTP 429) exceeded after 3 retries.");
         }
-        const parsedRetryAfter = retryAfterHeader ? parseInt(retryAfterHeader, 10) : NaN;
-        // A negative Retry-After is treated the same as a missing/non-numeric one - fall back to
-        // the default backoff schedule instead of sleeping a negative duration (which resolves
-        // near-instantly and produces a tight retry loop against an endpoint that just said 429).
-        const delayMs = !Number.isNaN(parsedRetryAfter) && parsedRetryAfter >= 0
-          ? Math.min(parsedRetryAfter * 1000, MAX_RETRY_AFTER_MS)
-          : DEFAULT_429_BACKOFF_MS[Math.min(rateLimitRetries, DEFAULT_429_BACKOFF_MS.length - 1)];
         rateLimitRetries++;
-        await sleep(delayMs);
+        if (retryAt - Date.now() > 5000) throw new BudgetUnavailableError(Math.ceil((retryAt - Date.now()) / 1000), retryAt, "provider_throttled");
         continue;
       }
 
       if (isThrottled(body)) {
+        const reported = body?.extensions?.cost?.requestedQueryCost;
+        const required = typeof reported === "number" && Number.isFinite(reported) ? Math.max(maxCost, reported) : maxCost;
+        if (!body?.extensions?.cost) governor.assumeDepleted();
+        const refillMs = body?.extensions?.cost
+          ? Math.max(1, governor.backoffMsFor(required))
+          : Math.max(1000, governor.backoffMsFor(required));
+        governor.deferUntil(Date.now() + refillMs);
         if (isMutation) {
           throw new JobberOutcomeUncertainError(
             "Jobber throttled this write before a result was returned. Its outcome is unknown; check Jobber before trying again."
@@ -287,15 +373,8 @@ async function executeGraphQL<T = any>(
           );
         }
         throttleRetries++;
-        if (body?.extensions?.cost) {
-          governor.recordCost(body.extensions.cost);
-          costRecorded = true;
-        } else {
-          // No cost data on this throttle response - stale optimistic state can't be trusted, so
-          // assume the budget is exhausted rather than retrying instantly against it.
-          governor.assumeDepleted();
-        }
-        await sleep(governor.backoffMsFor(maxCost));
+        if (attempts >= MAX_READ_ATTEMPTS) throw new JobberApiError("Jobber read exceeded its bounded retry attempts.");
+        if (refillMs > 5000) throw new BudgetUnavailableError(Math.ceil(refillMs / 1000), Date.now() + refillMs);
         continue;
       }
 
@@ -319,14 +398,11 @@ async function executeGraphQL<T = any>(
       }
       if (!isMutation && status >= 500 && fiveXxRetries < MAX_5XX_RETRIES) {
         fiveXxRetries++;
-        await sleep(FIVE_XX_BACKOFF_MS[Math.min(fiveXxRetries - 1, FIVE_XX_BACKOFF_MS.length - 1)]);
+        if (attempts >= MAX_READ_ATTEMPTS) throw new JobberApiError("Jobber read exceeded its bounded retry attempts.");
+        await sleep(FIVE_XX_BACKOFF_MS[Math.min(fiveXxRetries - 1, FIVE_XX_BACKOFF_MS.length - 1)], control.signal);
         continue;
       }
       if (!isMutation && status >= 500) {
-        if (body?.extensions?.cost) {
-          governor.recordCost(body.extensions.cost);
-          costRecorded = true;
-        }
         const detail = Array.isArray(body?.errors)
           ? ` - ${body.errors.map((error: any) => error.message).join("; ")}`
           : "";
@@ -334,13 +410,9 @@ async function executeGraphQL<T = any>(
       }
 
       if (Array.isArray(body?.errors) && body.errors.length > 0) {
-        if (body?.extensions?.cost) {
-          governor.recordCost(body.extensions.cost);
-          costRecorded = true;
-        }
         if (isMutation && status < 400 && body.data !== undefined) {
           const merged = mergeMutationErrorsIntoData<T>(body.data, body.errors);
-          if (merged !== undefined) return merged;
+          if (merged !== undefined) {mutationExecutionFailures.add(merged as object);return merged;}
         }
         const message = body.errors.map((e: any) => e.message).join("; ");
         if (isPermissionError(body)) throw new JobberPermissionError(message);
@@ -361,8 +433,8 @@ async function executeGraphQL<T = any>(
       }
 
       if (body?.extensions?.cost) {
-        governor.recordCost(body.extensions.cost);
-        costRecorded = true;
+        // Already applied before interpreting the response so errors and successful reads
+        // update the same shared account budget.
       }
 
       if (body?.data === undefined) {
@@ -375,14 +447,6 @@ async function executeGraphQL<T = any>(
       }
 
       return body.data as T;
-    }
-  } finally {
-    // If nothing ever gave us a real extensions.cost update, checkBudget's reservation never got
-    // corrected by real server data - release it so a failed/errored request doesn't permanently
-    // under-count the budget.
-    if (!costRecorded) {
-      governor.releaseReservation(maxCost);
-    }
   }
 }
 
@@ -393,9 +457,10 @@ async function executeGraphQL<T = any>(
 export async function jobberGraphQL<T = any>(
   query: string,
   variables: Record<string, unknown> | undefined,
-  maxCost: number
+  maxCost: number,
+  control: AdmissionControl = {}
 ): Promise<T> {
-  return executeGraphQL(query, variables, maxCost, false);
+  return executeGraphQL(query, variables, maxCost, false, control);
 }
 
 /**
@@ -406,7 +471,8 @@ export async function jobberGraphQL<T = any>(
 export async function jobberGraphQLWrite<T = any>(
   query: string,
   variables: Record<string, unknown> | undefined,
-  maxCost: number
+  maxCost: number,
+  control: AdmissionControl = {}
 ): Promise<T> {
-  return executeGraphQL(query, variables, maxCost, true);
+  return executeGraphQL(query, variables, maxCost, true, control);
 }
