@@ -62,7 +62,7 @@ const payment = (): Proposal => ({
   balance_after: "70.00",
   send_receipt: false,
 });
-async function setup(extra = false) {
+async function setup(extra = false, balance = "100.00") {
   const dir = mkdtempSync(path.join(os.tmpdir(), "jobber-browser-")),
     j = new WebJournal(path.join(dir, "state.db"), randomBytes(32));
   const context = await browser.newContext(),
@@ -76,7 +76,7 @@ async function setup(extra = false) {
       html =
         "<button onclick=\"location.href='/payments/new?clientId=1&invoiceId=10'\">Collect Payment</button>";
     else if (u.pathname === "/payments/new")
-      html = `<label>Payment method <button role="combobox" aria-label="Payment method" onclick="document.getElementById('choices').hidden=false">Credit/debit card</button></label><div id="choices" role="listbox" hidden>${["Cash", "Cheque", "E-transfer", "Other"].map((n) => `<span onclick="document.querySelector('[role=combobox]').innerText='${n}';document.getElementById('choices').hidden=true;document.getElementById('charge').remove();document.getElementById('offline').hidden=false">${n}</span>`).join("")}</div><button id="charge" onclick="fetch('/fixture/charge')">Charge $100.00</button><div id="offline" hidden><label>Transaction Date<input aria-label="Transaction Date"></label><label>Reference #<input aria-label="Reference #"></label><label>Details<textarea aria-label="Details"></textarea></label><p>1 selected</p><div><a href="/invoices/10">#1</a><input id="amount" value="$100.00" onblur="this.value='$'+Number(this.value.replace('$','')).toFixed(2)"><input type="checkbox" checked></div>${extra ? '<div><a href="/invoices/11">#2</a><input type="checkbox" checked></div>' : ""}<button onclick="fetch('/fixture/save').then(()=>location.href='/payments/777')">Save</button><button onclick="fetch('/fixture/receipt')">Save and Email Receipt</button></div>`;
+      html = `<label>Payment method <button role="combobox" aria-label="Payment method" onclick="document.getElementById('choices').hidden=false">Credit/debit card</button></label><div id="choices" role="listbox" hidden>${["Cash", "Cheque", "E-transfer", "Other"].map((n) => `<span onclick="document.querySelector('[role=combobox]').innerText='${n}';document.getElementById('choices').hidden=true;document.getElementById('charge').remove();document.getElementById('offline').hidden=false">${n}</span>`).join("")}</div><button id="charge" onclick="fetch('/fixture/charge')">Charge $100.00</button><div id="offline" hidden><label>Transaction Date<input aria-label="Transaction Date"></label><label>Reference #<input aria-label="Reference #"></label><label>Details<textarea aria-label="Details"></textarea></label><p>1 selected</p><div><a href="/invoices/10">#1</a><input id="amount" value="$${balance}" onblur="this.value='$'+Number(this.value.replace('$','')).toFixed(2)"><input type="checkbox" checked></div>${extra ? '<div><a href="/invoices/11">#2</a><input type="checkbox" checked></div>' : ""}<button onclick="fetch('/fixture/save').then(()=>location.href='/payments/777')">Save</button><button onclick="fetch('/fixture/receipt')">Save and Email Receipt</button></div>`;
     else if (u.pathname === "/properties/2/manually_geocode")
       html =
         '<a href="/clients/1/properties/2">Cancel</a><label>Latitude<input aria-label="Latitude" value="47"></label><label>Longitude<input aria-label="Longitude" value="-80"></label><button onclick="fetch(\'/fixture/pin\').then(()=>location.href=\'/clients/1/properties/2\')">Save</button>';
@@ -123,6 +123,13 @@ describe("scripted browser fixture using inspected form contracts", () => {
     ).toBe("777");
     expect(dispatches).toBe(1);
     expect(writes).toEqual({ save: 1, charge: 0, receipt: 0, pin: 0 });
+  });
+  it("rejects a balance changed between API preflight and the native form", async () => {
+    const { port, writes } = await setup(false, "90.00");
+    await expect(port.prepare(s, payment())).rejects.toThrow(
+      "website_invoice_balance_changed",
+    );
+    expect(writes.save).toBe(0);
   });
   it("refuses multiple selected invoices before dispatch", async () => {
     const { port, writes } = await setup(true);

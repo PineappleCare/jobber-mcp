@@ -9,6 +9,8 @@ import {
   type Proposal,
   type Snapshot,
   WebError,
+  cents,
+  distance,
   targetUrl,
 } from "./contracts.js";
 export interface BrowserPort {
@@ -178,6 +180,11 @@ export class JobberBrowser implements BrowserPort {
         if (numeric.length !== 1 || !numeric[0])
           throw new WebError("website_payment_amount_changed");
         const amount = page.locator(`[id=${JSON.stringify(numeric[0])}]`);
+        if (
+          cents((await amount.inputValue()).replace(/[$,\s]/g, "")) !==
+          cents(p.balance_before)
+        )
+          throw new WebError("website_invoice_balance_changed");
         await amount.fill(p.amount);
         await amount.blur();
         await page.getByText("1 selected", { exact: true }).waitFor();
@@ -230,6 +237,26 @@ export class JobberBrowser implements BrowserPort {
     )
       throw new WebError("website_target_mismatch");
     if (p?.action === "update_property_map_pin") {
+      if (p.before) {
+        const current = {
+          latitude: Number(
+            await page
+              .getByRole("textbox", { name: "Latitude", exact: true })
+              .inputValue(),
+          ),
+          longitude: Number(
+            await page
+              .getByRole("textbox", { name: "Longitude", exact: true })
+              .inputValue(),
+          ),
+        };
+        if (
+          !Number.isFinite(current.latitude) ||
+          !Number.isFinite(current.longitude) ||
+          distance(p.before, current) > 1
+        )
+          throw new WebError("website_property_pin_changed");
+      }
       await page
         .getByRole("textbox", { name: "Latitude", exact: true })
         .fill(String(p.coordinates.latitude));
