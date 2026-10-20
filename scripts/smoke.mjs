@@ -30,6 +30,9 @@ const EXPECTED_TOOLS = [
   "team_list",
   "list_tasks",
   "get_task",
+  "list_timesheet_users",
+  "list_time_entries",
+  "get_time_entry",
 ];
 
 function send(child, message) {

@@ -15,7 +15,7 @@ attribution remains in [LICENSE](LICENSE).
   operation, is audited with sensitive values hashed, and is never retried
   after an ambiguous result.
 - The server never exposes raw GraphQL, payment, refund, delete, archive,
-  bulk-mutation, webhook, expense, or timesheet tools.
+  bulk-mutation, webhook, expense, or timesheet mutation tools.
 
 The MCP host must require interactive approval for every write tool.
 
@@ -28,6 +28,34 @@ and audit-log access.
 Foundation reads are `search_records`, `get_record`, `catalog_search`, and
 `team_list`. They cover clients, properties, requests, quotes, jobs, invoices,
 visits, products/services, and assignable users.
+
+`list_timesheet_users`, `list_time_entries`, and `get_time_entry` read native
+employee labour entries. The roster includes active employees and deactivated
+employees with entries in the selected dates. The native roster accepts 1–7
+inclusive days; entry lists accept 1–31 inclusive days;
+entry dates default to `America/Toronto`. Entry selection uses the start date,
+not overlap: an overnight entry starting before the range is excluded, and a
+matching entry's full recorded duration is returned without clipping per day.
+Use `finalDuration`, not scheduled visit duration or a job note. Running entries
+return `recorded_duration_seconds: null`, never a misleading zero or estimated
+payroll total. An optional employee ID is sent as a native filter; an optional
+job ID is checked against this account and applied to each returned page.
+Continue through `next_cursor` even when a job-filtered page has no matches.
+No page alone establishes a complete total. Pay rates and time-entry writes,
+approval, payment, deletion and timer control remain unavailable.
+
+Timesheet reads require the app's Timesheets read scope and appropriate user
+permissions/feature availability. A scope change can require reauthorization.
+Permission denials are errors, not empty results or proof of a required plan
+upgrade. Hermes grants these tools through Williams' existing read connection;
+other company profiles and neutral default remain excluded.
+
+Property map-pin API check (October 20, 2026): live `2025-04-16` and
+`2026-09-25` schemas expose `Property.address.coordinates` for reads, but
+`PropertyEditInput.address` accepts only postal address fields and no pin
+coordinates. Coordinate inputs on billing/contact addresses are not a verified
+way to edit a selected property's map pin. No property-pin mutation or address
+workaround is exposed. A link in a client note does not change a native pin.
 
 `list_tasks` and `get_task` expose native tasks with schedules, assignments,
 links and a content-derived `task_version`. The `scheduling` capability enables

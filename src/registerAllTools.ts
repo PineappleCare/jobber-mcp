@@ -14,6 +14,7 @@ import { registerFoundationalTools } from "./tools/foundations.js";
 import { registerJobStatusTool } from "./tools/job-status.js";
 import { registerNoteTools } from "./tools/notes.js";
 import { registerTaskTools } from "./tools/tasks.js";
+import { registerTimesheetTools } from "./tools/timesheets.js";
 import { isReadOnly, isWriteCapabilityEnabled } from "./tool-helpers.js";
 
 /**
@@ -36,5 +37,6 @@ export function registerAllTools(server: McpServer): void {
   registerFoundationalTools(server);
   registerNoteTools(server);
   registerTaskTools(server);
+  registerTimesheetTools(server);
   if (!isReadOnly() && isWriteCapabilityEnabled("scheduling")) registerJobStatusTool(server);
 }

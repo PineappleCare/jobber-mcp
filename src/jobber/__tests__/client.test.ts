@@ -375,7 +375,7 @@ describe("jobberGraphQL - GraphQL errors", () => {
     });
   });
 
-  it("throws JobberPermissionError with a pricing-page link for plan/permission errors", async () => {
+  it("reports permission/scope failures without diagnosing a required plan upgrade", async () => {
     mockRequireSessionContext.mockReturnValue(null);
     mockGetValidAccessToken.mockResolvedValue("t");
     vi.stubGlobal(
@@ -386,7 +386,8 @@ describe("jobberGraphQL - GraphQL errors", () => {
     );
 
     await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(JobberPermissionError);
-    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(/pricing/);
+    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.toThrow(/OAuth scopes/);
+    await expect(jobberGraphQL("query { x }", undefined, 10)).rejects.not.toThrow(/Upgrade your Jobber plan/);
   });
 
   it("still records the cost extension into the governor on a generic (non-throttle) error response", async () => {

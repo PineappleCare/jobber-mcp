@@ -22,8 +22,8 @@ export class JobberGraphQLRequestError extends JobberApiError {
 export class JobberPermissionError extends JobberGraphQLRequestError {
   constructor(originalMessage?: string) {
     super(
-      "Jobber restricts this data to accounts on its top-tier plan. " +
-      "Upgrade your Jobber plan to use this feature: https://getjobber.com/pricing/" +
+      "Jobber denied access to this data. Check the app's OAuth scopes, the authorizing user's permissions, and feature availability. " +
+      "A permission denial alone does not establish that a plan upgrade is required." +
       (originalMessage ? ` (Jobber said: ${originalMessage})` : "")
     );
     this.name = "JobberPermissionError";
