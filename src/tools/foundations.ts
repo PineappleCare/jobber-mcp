@@ -31,7 +31,7 @@ type Node = Record<string, any>;
 
 const summaryFields = `id updatedAt jobberWebUri`;
 const clientFields = `${summaryFields} name firstName lastName companyName email phone billingAddress { street1 street2 city province postalCode country }`;
-const propertyFields = `id name street1 street2 city province postalCode country jobberWebUri`;
+const propertyFields = `id name street1 street2 city province postalCode country jobberWebUri address { coordinates { latitude longitude } }`;
 const requestFields = `${summaryFields} title requestStatus createdAt client { id name } property { id name }`;
 const quoteFields = `${summaryFields} quoteNumber title quoteStatus sentAt message amounts { total } client { id name } property { id name }`;
 const jobFields = `${summaryFields} jobNumber title jobType jobStatus instructions total billingType invoiceSchedule{billingFrequency} client { id name } property { id name } quote { id } request { id }`;
@@ -95,7 +95,7 @@ function response(action: string, recordType: string, record: Node) {
 function recordVersion(recordType: string, record: Node): string {
   if (typeof record.updatedAt === "string" && record.updatedAt) return record.updatedAt;
   const versionView = recordType === "property"
-    ? Object.fromEntries(["id", "name", "street1", "street2", "city", "province", "postalCode", "country"].map((key) => [key, record[key] ?? null]))
+    ? Object.fromEntries(["id", "name", "street1", "street2", "city", "province", "postalCode", "country", "address"].map((key) => [key, record[key] ?? null]))
     : recordType === "visit"
       ? {
           id: record.id,

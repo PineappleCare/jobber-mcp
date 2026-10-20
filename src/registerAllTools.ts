@@ -1,4 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/server";
+import { registerWebTools } from "./tools/web.js";
 import { registerAuthTools } from "./auth/authTools.js";
 import { registerResources } from "./resources/index.js";
 import { registerFindClientTool } from "./tools/find-client.js";
@@ -38,5 +39,6 @@ export function registerAllTools(server: McpServer): void {
   registerNoteTools(server);
   registerTaskTools(server);
   registerTimesheetTools(server);
+  registerWebTools(server);
   if (!isReadOnly() && isWriteCapabilityEnabled("scheduling")) registerJobStatusTool(server);
 }

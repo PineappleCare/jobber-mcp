@@ -152,6 +152,7 @@ function auditValidationFailures<T extends z.ZodTypeAny>(schema: T, toolName: st
 
 export function toolErrorType(error: unknown): string {
   const err = error instanceof Error ? error : new Error(String(error));
+  if (err.name === "JobberWebError") return "browser_operation_error";
   return err.name === "JobberOutcomeUncertainError"
     ? "outcome_uncertain"
     : ["JobberRejectedError", "JobberPermissionError", "JobberGraphQLRequestError"].includes(err.name)
@@ -241,7 +242,7 @@ function registerTool<
   );
 }
 
-export type WriteCapability = "records" | "scheduling" | "communications";
+export type WriteCapability = "records" | "scheduling" | "communications" | "web_payments" | "web_properties";
 
 /**
  * A second, narrow gate after JOBBER_READ_ONLY. This lets a host expose record

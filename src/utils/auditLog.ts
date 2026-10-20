@@ -30,6 +30,7 @@ const REDACTED_KEYS = new Set([
 // make the audit log useless for its purpose (knowing what was searched for), but the raw value
 // (e.g. a client's name/email/phone typed into find_client) shouldn't sit in plaintext forever.
 const HASHED_KEYS = new Set([
+  "proposal", "reference", "maps_url", "latitude", "longitude", "details",
   "search_term",
   // Write inputs can contain client names and internal operational notes. The
   // audit log needs evidence of the action, not a second plaintext copy.

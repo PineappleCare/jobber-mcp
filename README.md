@@ -11,10 +11,10 @@ attribution remains in [LICENSE](LICENSE).
 - Writes require both `JOBBER_READ_ONLY=false` and a deliberate
   `JOBBER_WRITE_CAPABILITIES` allowlist: `records`, `scheduling`, and/or
   `communications`.
-- Every write requires `confirm_write: true`, uses a fixed reviewed GraphQL
-  operation, is audited with sensitive values hashed, and is never retried
+- Every write requires `confirm_write: true`, uses a fixed reviewed API operation
+  or browser script, is audited with sensitive values hashed, and is never retried
   after an ambiguous result.
-- The server never exposes raw GraphQL, payment, refund, delete, archive,
+- The server never exposes raw GraphQL, card charging, refund, delete, archive,
   bulk-mutation, webhook, expense, or timesheet mutation tools.
 
 The MCP host must require interactive approval for every write tool.
@@ -54,8 +54,7 @@ Property map-pin API check (October 20, 2026): live `2025-04-16` and
 `2026-09-25` schemas expose `Property.address.coordinates` for reads, but
 `PropertyEditInput.address` accepts only postal address fields and no pin
 coordinates. Coordinate inputs on billing/contact addresses are not a verified
-way to edit a selected property's map pin. No property-pin mutation or address
-workaround is exposed. A link in a client note does not change a native pin.
+way to edit a selected property's map pin. The optional browser extension below provides native pin editing without changing addresses. A link in a client note does not change a native pin.
 
 `list_tasks` and `get_task` expose native tasks with schedules, assignments,
 links and a content-derived `task_version`. The `scheduling` capability enables
@@ -302,3 +301,60 @@ The service credential cannot authenticate `/mcp` or the voice API. Browser orig
 and arbitrary operations are rejected. No Jobber mutation is available. Keep this
 route on the private Docker network. Only the Williams contact worker receives its
 service credential; the connector remains the sole owner of OAuth/refresh state.
+
+
+## Optional browser-backed staff tools
+
+Opt-in Williams Desktop tools add offline payment recording and native property
+map-pin edits. `preview_invoice_payment` and `preview_property_map_pin` produce
+complete immutable proposals. `record_invoice_payment` and
+`update_property_map_pin` require the exact full proposal, a stable UUID
+`operation_id`, and `confirm_write: true` after human approval. A preview expires
+after 30 minutes, browser reauthentication or service restart. A repeated operation
+returns its recorded result; a proposal cannot be dispatched under a second ID.
+`get_web_operation` reconciles through reads only; `jobber_web_status` reports
+browser readiness separately from OAuth/API health.
+
+Offline payment methods are cash, cheque, e-transfer, bank transfer and other.
+Bank transfer is explicitly recorded as Other with a disclosed details prefix.
+Amounts are positive decimal strings with two places; this release is restricted
+to the verified Canadian Williams account and CAD. Review the invoice, amount,
+date, method, reference, details and resulting balance. No card is charged,
+receipt sent, refund made, or invoice closed without a payment. The script refuses
+multiple selected invoices and targets the exact **Save** button. New payments
+are verified against returned payment IDs and fresh paginated API history; a
+matching amount/date alone cannot attribute another operator's payment. A lost
+response without sufficient evidence remains uncertain and blocks overlapping
+writes until staff reconciliation; never create a new ID to retry automatically.
+
+Map-pin previews accept coordinates or a Google Maps link. Link resolution uses
+separate unauthenticated requests with checked/pinned network destinations and
+bounded approved-host redirects. Ambiguous locations and viewport-only links need
+explicit coordinates. Review the exact client/property and current/proposed pin.
+Readback checks the new coordinates within one metre and unchanged postal address.
+Employee labour writes, arbitrary navigation/JavaScript/HTTP, payment deletion,
+card charging and bulk operations remain unavailable.
+
+Enable discovery with `JOBBER_WEB_ENABLED=true`, `JOBBER_WEB_URL` (private browser
+service URL), `JOBBER_WEB_SERVICE_KEY` and `JOBBER_WEB_ACCOUNT_ID`. Writes also need
+`JOBBER_READ_ONLY=false` and individually reviewed `web_payments` / `web_properties`
+values in `JOBBER_WRITE_CAPABILITIES`. Normal API tools work when the browser is
+unavailable. Browser operations never enter the voice or contact-sync APIs.
+
+`Dockerfile.web` builds the separate service. Its environment additionally needs
+`JOBBER_WEB_STATE_DIR`, a separate 64-hex `JOBBER_WEB_ENCRYPTION_KEY`,
+`JOBBER_WEB_VIEWER_ORIGIN` (including `/jobber-browser`),
+`JOBBER_WEB_VIEWER_OWNER`, and a distinct `JOBBER_WEB_VIEWER_KEY`. The private API
+listens on 3100; only 3101 is routed through SSO. The viewer requires both trusted
+owner identity and the proxy credential on HTTP and WebSocket requests. CSRF
+Origin checks protect login controls. Manual mode excludes automation, revokes
+old proposals and closes viewer connections before resuming. Persistent browser
+authentication and operation/proposal data are encrypted; Chromium's temporary
+profile is disposable. MFA/login is completed manually and never resumes a write.
+
+See [the inspected website contract](browser/CONTRACT.md) for source observations,
+Linux sandbox requirements and live-acceptance limits. Browser and fixture tests
+use synthetic records and do not establish a successful live business mutation.
+Ansible's opt-in `just play jobber-web` rollout is documented in the Hermes guide;
+stop for release review before deployment and use separately approved genuine
+business operations for final live acceptance.
