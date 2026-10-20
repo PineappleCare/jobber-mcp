@@ -20,6 +20,71 @@ const service = () => ({
   get: vi.fn(),
 });
 describe("browser private API and owner-only viewer", () => {
+  it.each([
+    ["é", 1],
+    ["🙂", 1],
+    ["🙂", 3],
+  ] as const)(
+    "preserves UTF-8 payment references when %s is split after byte %s",
+    async (character, split) => {
+      const previewPayment = vi.fn(async (input) => input);
+      const server = apiServer({ previewPayment } as any, "a".repeat(32));
+      const url = await listen(server);
+      const reference = `Payment ${character} received`;
+      const data = Buffer.from(
+        JSON.stringify({
+          input: {
+            invoice_id: "invoice",
+            amount: "30.00",
+            transaction_date: "2026-10-20",
+            method: "e_transfer",
+            reference,
+          },
+          snapshot: {
+            account_id: "account",
+            country: "CA",
+            target_id: "invoice",
+            client_id: "client",
+            client_name: "Fixture",
+            title: "Fixture",
+            url: "https://secure.getjobber.com/invoices/10",
+            version: "v1",
+            balance: "100.00",
+            payments: [],
+          },
+        }),
+      );
+      const offset = data.indexOf(Buffer.from(character)) + split;
+      const result = await new Promise<any>((resolve, reject) => {
+        const client = request(
+          url + "/v1/preview-payment",
+          {
+            method: "POST",
+            headers: { Authorization: "Bearer " + "a".repeat(32) },
+          },
+          (response) => {
+            const chunks: Buffer[] = [];
+            response.on("data", (chunk) => chunks.push(chunk));
+            response.on("end", () => {
+              try {
+                resolve(JSON.parse(Buffer.concat(chunks).toString()));
+              } catch (error) {
+                reject(error);
+              }
+            });
+          },
+        );
+        client.on("error", reject);
+        // Send the remainder only after the server receives the split prefix.
+        server.once("request", (incoming) =>
+          incoming.once("data", () => client.end(data.subarray(offset))),
+        );
+        client.write(data.subarray(0, offset));
+      });
+      expect(result.reference).toBe(reference);
+      expect(previewPayment).toHaveBeenCalledOnce();
+    },
+  );
   it("requires a separate bearer, rejects browser origins and arbitrary operations", async () => {
     const s = service(),
       url = await listen(apiServer(s as any, "a".repeat(32)));

@@ -41,11 +41,9 @@ beforeEach(() => {
   journal = new WebJournal(path.join(dir, "ops.db"), randomBytes(32));
   browser = {
     identity: vi.fn().mockResolvedValue(account),
-    prepare: vi
-      .fn()
-      .mockResolvedValue({
-        native_methods: ["Cash", "Cheque", "E-transfer", "Other"],
-      }),
+    prepare: vi.fn().mockResolvedValue({
+      native_methods: ["Cash", "Cheque", "E-transfer", "Other"],
+    }),
     submit: vi.fn(async (_p, dispatch) => {
       dispatch();
       return "777";
@@ -56,6 +54,7 @@ beforeEach(() => {
   service = new WebService(journal, browser, account);
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   journal.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -185,6 +184,31 @@ describe("durable browser writes", () => {
     ).rejects.toThrow("operation_payload_changed");
     expect(browser.submit).toHaveBeenCalledTimes(1);
   });
+  it.each(["prepare", "submit"])(
+    "does not dispatch when the preview expires during browser %s",
+    async (phase) => {
+      const input = await ready();
+      const clock = vi.spyOn(Date, "now");
+      let submissions = 0;
+      if (phase === "prepare")
+        browser.prepare.mockImplementation(async () => {
+          clock.mockReturnValue(input.proposal.expires_at);
+          return {};
+        });
+      browser.submit.mockImplementation(async (_p: any, dispatch: any) => {
+        if (phase === "submit")
+          clock.mockReturnValue(input.proposal.expires_at + 1);
+        dispatch();
+        submissions++;
+        return "777";
+      });
+      await expect(service.execute(input, invoice())).rejects.toThrow(
+        "proposal_expired",
+      );
+      expect(submissions).toBe(0);
+      expect(journal.operation(input.operation_id)).toBeUndefined();
+    },
+  );
   it("blocks another unresolved write on the same target and proposal reuse", async () => {
     const a = await ready();
     await service.execute(a, invoice());

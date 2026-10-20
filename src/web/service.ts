@@ -46,6 +46,14 @@ export class WebService {
     if (s.account_id !== this.account || s.country !== "CA")
       throw new WebError("account_mismatch");
   }
+  private checkProposal(p: Proposal): void {
+    if (
+      p.account_id !== this.account ||
+      p.auth_epoch !== this.epoch ||
+      p.expires_at <= Date.now()
+    )
+      throw new WebError("proposal_expired");
+  }
   async status(): Promise<any> {
     if (this.manual)
       return {
@@ -193,18 +201,16 @@ export class WebService {
       const saved = this.journal.getProposal(p.proposal_id);
       if (digest(saved.proposal) !== digest(p))
         throw new WebError("proposal_changed");
-      if (
-        p.account_id !== this.account ||
-        p.auth_epoch !== this.epoch ||
-        p.expires_at < Date.now()
-      )
-        throw new WebError("proposal_expired");
+      this.checkProposal(p);
       if (digest(s) !== p.expected_snapshot)
         throw new WebError("record_changed_repreview_required");
       await this.browser.prepare(s, p);
       let dispatched = false;
       try {
         const record = await this.browser.submit(p, () => {
+          // Form preparation and the final account check can cross the deadline.
+          // Revalidate immediately before recording dispatch intent and Save.
+          this.checkProposal(p);
           this.journal.begin(input);
           dispatched = true;
         });

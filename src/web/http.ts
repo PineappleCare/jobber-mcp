@@ -26,13 +26,16 @@ function reply(res: ServerResponse, status: number, value: unknown): void {
   res.end(JSON.stringify(value));
 }
 async function body(req: IncomingMessage): Promise<unknown> {
-  let text = "";
+  const chunks: Buffer[] = [];
+  let bytes = 0;
   for await (const chunk of req) {
-    text += chunk.toString();
-    if (Buffer.byteLength(text) > 1024 * 1024)
-      throw new WebError("request_too_large");
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.length;
+    if (bytes > 1024 * 1024) throw new WebError("request_too_large");
+    chunks.push(buffer);
   }
-  return JSON.parse(text);
+  // A network chunk can end in the middle of a UTF-8 character.
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 function equal(a: string, b: string): boolean {
   const x = Buffer.from(a),

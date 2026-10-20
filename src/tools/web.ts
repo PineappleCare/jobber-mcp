@@ -26,7 +26,7 @@ import { webCall } from "../web/client.js";
 import { appendAuditLog } from "../utils/auditLog.js";
 const ACCOUNT = `query WebAccount { account { id countryCode } }`;
 const INVOICE = `query WebInvoice($id:EncodedId!){invoice(id:$id){id updatedAt invoiceNumber subject invoiceStatus jobberWebUri client{id name} amounts{invoiceBalance}}}`;
-const PAYMENTS = `query WebPayments($client:EncodedId!,$after:String){paymentRecords(first:20,after:$after,filter:{clientId:$client}){nodes{__typename id amount entryDate details client{id} invoice{id} allocations(first:20){nodes{amount ... on InvoicePaymentRecordAllocation{invoice{id}}} pageInfo{hasNextPage endCursor}} ... on CheckPaymentRecord{reference:checkNumber} ... on ETransferPaymentRecord{reference:confirmationNumber} ... on OtherPaymentRecord{reference:confirmationNumber}} pageInfo{hasNextPage endCursor}}}`;
+const PAYMENTS = `query WebPayments($client:EncodedId!,$after:String){paymentRecords(first:20,after:$after,filter:{clientId:$client}){nodes{__typename id adjustmentType amount entryDate details client{id} invoice{id} allocations(first:20){nodes{amount ... on InvoicePaymentRecordAllocation{invoice{id}}} pageInfo{hasNextPage endCursor}} ... on CheckPaymentRecord{reference:checkNumber} ... on ETransferPaymentRecord{reference:confirmationNumber} ... on OtherPaymentRecord{reference:confirmationNumber}} pageInfo{hasNextPage endCursor}}}`;
 const PROPERTY = `query WebProperty($id:EncodedId!){property(id:$id){id name street1 street2 city province postalCode country jobberWebUri client{id name} address{coordinates{latitude longitude}}}}`;
 const METHODS: Record<string, string> = {
   CashPaymentRecord: "Cash",
@@ -86,6 +86,23 @@ export async function readWebSnapshot(
     for (const p of connection.nodes) {
       if (p.client?.id !== i.client.id)
         throw new WebError("payment_client_mismatch");
+      // amount is absolute in this API. Only actual receipts belong in the
+      // duplicate/readback history; refunds and accounting adjustments do not.
+      switch (p.adjustmentType) {
+        case "PAYMENT":
+        case "DEPOSIT":
+          break;
+        case "INVOICE":
+        case "REFUND":
+        case "CORRECTION":
+        case "INITIAL_BALANCE":
+        case "FAILED_ACH_PAYMENT":
+        case "BAD_DEBT":
+        case "VOIDED":
+          continue;
+        default:
+          throw new WebError("unsupported_payment_adjustment_type");
+      }
       if (p.allocations?.pageInfo.hasNextPage)
         throw new WebError("payment_allocation_scan_incomplete");
       const allocations = (p.allocations?.nodes ?? []).filter(

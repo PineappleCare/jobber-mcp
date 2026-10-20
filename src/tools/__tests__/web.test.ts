@@ -29,6 +29,7 @@ const page = (nodes: any[], more = false, cursor: string | null = null) => ({
 const payment = (n: number) => ({
   id: `pay${n}`,
   __typename: "ETransferPaymentRecord",
+  adjustmentType: "PAYMENT",
   amount: 10,
   entryDate: "2026-10-20T12:00:00Z",
   details: "private payment memo",
@@ -125,6 +126,65 @@ describe("MCP browser business tool boundary", () => {
     await expect(
       readWebSnapshot((q, v) => read(q, v), "payment", "invoice"),
     ).rejects.toThrow("invoice_changed");
+  });
+  it.each([
+    "INVOICE",
+    "REFUND",
+    "CORRECTION",
+    "INITIAL_BALANCE",
+    "FAILED_ACH_PAYMENT",
+    "BAD_DEBT",
+    "VOIDED",
+  ])(
+    "does not treat %s as a received payment while scanning every page",
+    async (adjustmentType) => {
+      read
+        .mockResolvedValueOnce({ account })
+        .mockResolvedValueOnce({ invoice })
+        .mockResolvedValueOnce({
+          paymentRecords: page(
+            [
+              {
+                ...payment(1),
+                adjustmentType,
+                __typename:
+                  adjustmentType === "REFUND"
+                    ? "RefundPaymentRecord"
+                    : "OtherPaymentRecord",
+              },
+            ],
+            true,
+            "next",
+          ),
+        })
+        .mockResolvedValueOnce({
+          paymentRecords: page([
+            payment(2),
+            { ...payment(3), adjustmentType: "DEPOSIT" },
+          ]),
+        })
+        .mockResolvedValueOnce({ invoice });
+      const result = await readWebSnapshot(
+        (q, v) => read(q, v),
+        "payment",
+        "invoice",
+      );
+      expect(result.payments?.map((p) => p.id)).toEqual(["pay2", "pay3"]);
+      expect(read).toHaveBeenCalledTimes(5);
+      expect(write).not.toHaveBeenCalled();
+    },
+  );
+  it("fails closed for an unrecognized adjustment classification", async () => {
+    read
+      .mockResolvedValueOnce({ account })
+      .mockResolvedValueOnce({ invoice })
+      .mockResolvedValueOnce({
+        paymentRecords: page([{ ...payment(1), adjustmentType: "NEW_KIND" }]),
+      });
+    await expect(
+      readWebSnapshot((q, v) => read(q, v), "payment", "invoice"),
+    ).rejects.toThrow("unsupported_payment_adjustment_type");
+    expect(write).not.toHaveBeenCalled();
   });
   it("returns browser login errors as completed tool failures without performing API mutations", async () => {
     call.mockRejectedValue(new Error("login_required"));
