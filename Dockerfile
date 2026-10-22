@@ -1,4 +1,4 @@
-FROM node:22.23.3-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS build
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS build
 
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -8,7 +8,7 @@ COPY src ./src
 COPY browser ./browser
 RUN npm run build && npm prune --omit=dev --ignore-scripts
 
-FROM node:22.23.3-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 
 ENV NODE_ENV=production
 WORKDIR /app
